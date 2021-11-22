@@ -14,7 +14,7 @@ dashmap = "3"
 futures = "0.3"
 libc = "0.2"
 pico-args = "0.3"
-polyfuse = "0.4"
+polyfuse = { git = "https://github.com/masnagam/polyfuse.git" }
 slab = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = [ "full" ] }
