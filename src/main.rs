@@ -16,28 +16,36 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     io::{self, prelude::*},
-    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
     time::Duration,
 };
+use structopt::StructOpt;
 use tokio::{
     io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 use tracing::Instrument as _;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args = Args::from_env().context("Failed to parse command line arguments")?;
-    dbg!(&args);
+    let opt = Opt::from_args();
 
-    ensure!(args.mountpoint.is_dir(), "mountpoint must be a directory");
+    ensure!(opt.remote.scheme() == "sftp", "remote url must be a sftp URL");
+    ensure!(!opt.remote.username().is_empty(), "remote url must has an username part");
+    ensure!(opt.remote.has_host(), "remote url must has a host part");
+    ensure!(opt.mountpoint.is_dir(), "mountpoint must be a directory");
 
-    let (mut child, stream) = establish_connection(&args.host, &args.username)
+    let sftp_user = opt.remote.username();
+    let sftp_host = opt.remote.host_str().unwrap();
+    let sftp_port = opt.remote.port().unwrap_or(22);
+    let sftp_path = opt.remote.path();
+
+    let (mut child, stream) = establish_connection(sftp_user, sftp_host, sftp_port)
         .context("failed to establish SSH connection")?;
 
     let (sftp, conn) = crate::sftp::init(stream)
@@ -51,10 +59,16 @@ async fn main() -> Result<()> {
     //     .context("failed to get target attribute")?;
     // ensure!(stat.is_dir(), "the target path is not directory");
 
-    let fuse = AsyncSession::mount(args.mountpoint, {
+    let fuse = AsyncSession::mount(opt.mountpoint, {
         let mut config = KernelConfig::default();
         config.mount_option("fsname=sshfs");
         config.mount_option("default_permissions");
+        for mount_option in opt.options.iter() {
+            config.mount_option(mount_option);
+        }
+        if let Some(ref fusermount_path) = opt.fusermount_path {
+            config.fusermount_path(fusermount_path);
+        }
         config
     })
     .await
@@ -62,7 +76,7 @@ async fn main() -> Result<()> {
 
     let mut sshfs = SSHFS {
         sftp,
-        base_dir: args.base_dir,
+        base_dir: PathBuf::from(sftp_path),
         path_table: PathTable::new(),
         dir_handles: Slab::new(),
         file_handles: Slab::new(),
@@ -85,39 +99,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct Args {
+#[derive(Debug, StructOpt)]
+struct Opt {
+    /// FUSE options.
+    #[structopt(short, number_of_values = 1)]
+    options: Vec<String>,
+
+    /// Absolute path to fusermount or fusermount3.
+    #[structopt(long, parse(from_os_str))]
+    fusermount_path: Option<PathBuf>,
+
+    /// URL of the target directory on the remote host like sftp://user@remote/path/to/dir.
+    #[structopt(parse(try_from_str = Url::parse))]
+    remote: Url,
+
+    /// Mount point.
+    #[structopt(parse(from_os_str))]
     mountpoint: PathBuf,
-    host: SocketAddr,
-    username: String,
-    base_dir: PathBuf,
-}
-
-impl Args {
-    fn from_env() -> Result<Self> {
-        let mut args = pico_args::Arguments::from_env();
-
-        let host = args
-            .opt_value_from_str(["-h", "--host"])?
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 22)));
-
-        let username = args
-            .opt_value_from_str(["-u", "--user"])?
-            .unwrap_or_else(whoami::username);
-
-        let directory = args
-            .opt_value_from_str(["-d", "--directory"])?
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let mountpoint: PathBuf = args.free_from_str()?.context("missing mountpoint")?;
-
-        Ok(Self {
-            mountpoint,
-            host,
-            username,
-            base_dir: directory,
-        })
-    }
 }
 
 // ==== PathTable ====
@@ -617,12 +615,15 @@ impl AsyncWrite for Stream {
     }
 }
 
-fn establish_connection(addr: &SocketAddr, username: &str) -> Result<(Child, Stream)> {
+fn establish_connection(user: &str, host: &str, port: u16) -> Result<(Child, Stream)> {
     let mut cmd = Command::new("ssh");
-    cmd.arg("-p")
-        .arg(addr.port().to_string())
-        .arg(format!("{}@{}", username, addr.ip().to_string()))
-        .args(&["-s", "sftp"])
+    cmd.arg("-s")
+        .arg("-x")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(format!("{}@{}", user, host))
+        .arg("sftp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
 

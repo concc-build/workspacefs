@@ -13,11 +13,12 @@ bytes = "1.1.0"
 dashmap = "4.0.2"
 futures = "0.3.17"
 libc = "0.2.108"
-pico-args = "0.3"
 polyfuse = { git = "https://github.com/masnagam/polyfuse.git" }
 slab = "0.4.5"
+structopt = "0.3.25"
 thiserror = "1.0.30"
 tokio = { version = "1.14.0", features = [ "full" ] }
 tracing = "0.1.29"
 tracing-subscriber = "0.3.2"
+url = "2.2.2"
 whoami = "1.2.0"
