@@ -333,7 +333,7 @@ impl SSHFS {
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         }
 
-        let fh = self.dir_handles.insert(DirHandle { entries, offset: 0 }) as u64;
+        let fh = self.dir_handles.insert(DirHandle { entries }) as u64;
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -343,7 +343,9 @@ impl SSHFS {
     }
 
     fn do_readdir(&mut self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
-        let span = tracing::debug_span!("readdir", ino = op.ino());
+        let span = tracing::debug_span!(
+            "readdir", ino = op.ino(), fh = op.fh(), offset = op.offset(),
+            size = op.size());
         let _enter = span.enter();
 
         if op.mode() == op::ReaddirMode::Plus {
@@ -355,13 +357,23 @@ impl SSHFS {
             None => return req.reply_error(libc::EINVAL),
         };
 
+        let offset = op.offset() as usize;
+        if offset >= handle.entries.len() {
+            tracing::debug!("no entry to read");
+            return req.reply(());
+        }
+
+        let mut nread = 0;
         let mut out = ReaddirOut::new(op.size() as usize);
-        for entry in handle.entries.iter().skip(op.offset() as usize) {
-            if out.entry(&entry.name, entry.ino, entry.typ, handle.offset + 1) {
+        for (i, entry) in handle.entries.iter().enumerate().skip(offset) {
+            if out.entry(&entry.name, entry.ino, entry.typ, (i + 1) as u64) {
+                tracing::debug!("buffer fulled");
                 break;
             }
-            handle.offset += 1;
+            nread += 1;
         }
+
+        tracing::debug!("read {} entries", nread);
         req.reply(out)
     }
 
@@ -513,7 +525,6 @@ impl SSHFS {
 
 struct DirHandle {
     entries: Vec<DirEntry>,
-    offset: u64,
 }
 
 #[derive(Debug)]
@@ -524,14 +535,25 @@ struct DirEntry {
 }
 
 fn fill_attr(attr: &mut FileAttr, st: &sftp::FileAttr) {
-    attr.size(st.size.unwrap_or(0));
+    let size = st.size.unwrap_or(0);
+    let mtime = Duration::from_secs(st.mtime().unwrap_or(0).into());
+
+    attr.size(size);
     attr.mode(st.permissions.unwrap_or(0));
     attr.uid(st.uid().unwrap_or(0));
     attr.gid(st.gid().unwrap_or(0));
     attr.atime(Duration::from_secs(st.atime().unwrap_or(0).into()));
-    attr.mtime(Duration::from_secs(st.mtime().unwrap_or(0).into()));
+    attr.mtime(mtime);
+    attr.ctime(mtime);
 
     attr.nlink(1);
+
+    if cfg!(target_os = "linux") {
+        const BSIZE: u64 = 4096;
+        let blocks = ((size + BSIZE - 1) & !(BSIZE - 1)) >> 9;
+        attr.blksize(BSIZE as u32);
+        attr.blocks(blocks);
+    }
 }
 
 fn sftp_error_to_errno(err: &sftp::Error) -> i32 {
