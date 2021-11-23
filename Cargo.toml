@@ -22,3 +22,6 @@ tracing = "0.1.29"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 url = "2.2.2"
 whoami = "1.2.0"
+
+[profile.release]
+debug = true
