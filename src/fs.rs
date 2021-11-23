@@ -178,7 +178,10 @@ impl SSHFS {
             Operation::Write(op, data) => self.do_write(&req, op, data).await?,
             Operation::Release(op) => self.do_release(&req, op).await?,
 
-            _ => req.reply_error(libc::ENOSYS)?,
+            op @ _ => {
+                tracing::trace!(?op);
+                req.reply_error(libc::ENOSYS)?
+            }
         }
 
         Ok(())
@@ -200,6 +203,8 @@ impl SSHFS {
             Ok(stat) => stat,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
+
+        tracing::debug!(?stat);
 
         let inode = self.path_table.recognize(&path);
         inode.refcount += 1;
@@ -299,10 +304,17 @@ impl SSHFS {
                         .recognize(&dirname.join(&entry.filename))
                         .ino;
 
+                    let typ = entry
+                        .attrs
+                        .permissions
+                        .map_or(libc::DT_REG as u32, |perm| {
+                            (perm & libc::S_IFMT) >> 12
+                        });
+
                     dst.push(DirEntry {
                         name: entry.filename,
                         ino,
-                        typ: libc::DT_UNKNOWN as u32,
+                        typ,
                     });
                 }
                 dst
