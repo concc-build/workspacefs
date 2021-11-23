@@ -55,7 +55,7 @@ pub(crate) async fn mount(opt: Opt,  sftp: Session) -> Result<()> {
         .context("failed to receive FUSE request")?
     {
         sshfs
-            .handle_request(&req)
+            .handle_request(req)
             .await
             .context("failed to send FUSE reply")?;
     }
@@ -148,29 +148,35 @@ struct SSHFS {
     base_dir: PathBuf,
     path_table: PathTable,
     dir_handles: Slab<DirHandle>,
-    file_handles: Slab<sftp::FileHandle>,
+    file_handles: Slab<FileState>,
+}
+
+#[derive(Clone)]
+struct FileState {
+    open_flags: sftp::OpenFlag,
+    handle: Option<sftp::FileHandle>,
 }
 
 impl SSHFS {
-    async fn handle_request(&mut self, req: &Request) -> Result<()> {
+    async fn handle_request(&mut self, req: Request) -> Result<()> {
         let span = tracing::debug_span!("handle_request", unique = req.unique());
         let _enter = span.enter();
 
         match req.operation()? {
-            Operation::Lookup(op) => self.do_lookup(req, op).await?,
+            Operation::Lookup(op) => self.do_lookup(&req, op).await?,
             Operation::Forget(forgets) => self.do_forget(forgets.as_ref()),
 
-            Operation::Getattr(op) => self.do_getattr(req, op).await?,
-            Operation::Readlink(op) => self.do_readlink(req, op).await?,
+            Operation::Getattr(op) => self.do_getattr(&req, op).await?,
+            Operation::Readlink(op) => self.do_readlink(&req, op).await?,
 
-            Operation::Opendir(op) => self.do_opendir(req, op).await?,
-            Operation::Readdir(op) => self.do_readdir(req, op)?,
-            Operation::Releasedir(op) => self.do_releasedir(req, op)?,
+            Operation::Opendir(op) => self.do_opendir(&req, op).await?,
+            Operation::Readdir(op) => self.do_readdir(&req, op)?,
+            Operation::Releasedir(op) => self.do_releasedir(&req, op)?,
 
-            Operation::Open(op) => self.do_open(req, op).await?,
-            Operation::Read(op) => self.do_read(req, op).await?,
-            Operation::Write(op, data) => self.do_write(req, op, data).await?,
-            Operation::Release(op) => self.do_release(req, op).await?,
+            Operation::Open(op) => self.do_open(&req, op)?,
+            Operation::Read(op) => self.do_read(&req, op).await?,
+            Operation::Write(op, data) => self.do_write(&req, op, data).await?,
+            Operation::Release(op) => self.do_release(&req, op).await?,
 
             _ => req.reply_error(libc::ENOSYS)?,
         }
@@ -355,7 +361,7 @@ impl SSHFS {
         req.reply(())
     }
 
-    async fn do_open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
+    fn do_open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("open", ino = op.ino());
         let _enter = span.enter();
 
@@ -367,26 +373,20 @@ impl SSHFS {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        let pflags = match op.flags() as i32 & libc::O_ACCMODE {
+        let open_flags = match op.flags() as i32 & libc::O_ACCMODE {
             libc::O_RDONLY => sftp::OpenFlag::READ,
             libc::O_WRONLY => sftp::OpenFlag::WRITE,
             libc::O_RDWR => sftp::OpenFlag::READ | sftp::OpenFlag::WRITE,
             _ => sftp::OpenFlag::empty(),
         };
 
-        let handle = match self
-            .sftp
-            .open(&full_path, pflags, &Default::default())
-            .await
-        {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::error!("reply_err({:?})", err);
-                return req.reply_error(sftp_error_to_errno(&err));
-            }
+        let state = FileState {
+            open_flags,
+            handle: None,
         };
 
-        let fh = self.file_handles.insert(handle) as u64;
+        let fh = self.file_handles.insert(state) as u64;
+        tracing::debug!(?fh);
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -398,9 +398,9 @@ impl SSHFS {
         let span = tracing::debug_span!("read", ino = op.ino(), fh = op.fh());
         let _enter = span.enter();
 
-        let handle = match self.file_handles.get(op.fh() as usize) {
-            Some(handle) => handle,
-            None => return req.reply_error(libc::EINVAL),
+        let handle = match self.ensure_open(op.ino(), op.fh()).await {
+            Ok(handle) => handle,
+            Err(err) => return req.reply_error(err),
         };
 
         match self.sftp.read(&handle, op.offset(), op.size()).await {
@@ -418,9 +418,9 @@ impl SSHFS {
         let span = tracing::debug_span!("write", ino = op.ino(), fh = op.fh());
         let _enter = span.enter();
 
-        let handle = match self.file_handles.get(op.fh() as usize) {
-            Some(handle) => handle,
-            None => return req.reply_error(libc::EINVAL),
+        let handle = match self.ensure_open(op.ino(), op.fh()).await {
+            Ok(handle) => handle,
+            Err(err) => return req.reply_error(err),
         };
 
         let mut content = vec![];
@@ -442,12 +442,60 @@ impl SSHFS {
         let span = tracing::debug_span!("release", ino = op.ino());
         let _enter = span.enter();
 
-        let handle = self.file_handles.remove(op.fh() as usize);
+        let state = self.file_handles.remove(op.fh() as usize);
 
-        match self.sftp.close(&handle).await {
-            Ok(()) => req.reply(()),
-            Err(err) => req.reply_error(sftp_error_to_errno(&err)),
+        if let Some(handle) = state.handle {
+            if let Err(err) = self.sftp.close(&handle).await {
+                tracing::error!(?err);
+                return req.reply_error(sftp_error_to_errno(&err));
+            }
         }
+
+        req.reply(())
+    }
+
+    async fn ensure_open(
+        &mut self,
+        ino: u64,
+        fh: u64
+    ) -> Result<sftp::FileHandle, i32> {
+        let span = tracing::debug_span!("ensure_open", ino = ino, fh = fh);
+        let _enter = span.enter();
+
+        let path = match self.path_table.get(ino) {
+            Some(path) => path,
+            None => return Err(libc::EINVAL),
+        };
+
+        let full_path = self.base_dir.join(path);
+        tracing::debug!(?full_path);
+
+        let state = match self.file_handles.get(fh as usize) {
+            Some(state) => state.clone(),
+            None => return Err(libc::EINVAL),
+        };
+
+        if let Some(handle) = state.handle {
+            return Ok(handle);
+        }
+
+        let handle = match self
+            .sftp
+            .open(&full_path, state.open_flags, &Default::default())
+            .await
+        {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::error!("reply_err({:?})", err);
+                return Err(sftp_error_to_errno(&err));
+            }
+        };
+
+        self.file_handles
+            .get_mut(fh as usize)
+            .unwrap().handle = Some(handle.clone());
+
+        Ok(handle)
     }
 }
 
