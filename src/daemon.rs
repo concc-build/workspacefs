@@ -12,6 +12,7 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -33,6 +34,7 @@ type SftpResult<T> = std::result::Result<T, sftp::Error>;
 pub(crate) enum Message {
     Request(Request),
     ReplyLookup(usize, PathBuf, SftpResult<sftp::FileAttr>),
+    ReplyGetattr(usize, PathBuf, SftpResult<sftp::FileAttr>),
     ReplyOpenDir(usize, PathBuf, SftpResult<Vec<sftp::DirEntry>>),
 }
 
@@ -41,6 +43,7 @@ impl fmt::Debug for Message {
         match *self {
             Self::Request(..) => write!(f, "Message::Request"),
             Self::ReplyLookup(..) => write!(f, "Message::ReplyLookup"),
+            Self::ReplyGetattr(..) => write!(f, "Message::ReplyGetattr"),
             Self::ReplyOpenDir(..) => write!(f, "Message::ReplyOpenDir"),
         }
     }
@@ -55,6 +58,10 @@ pub(crate) struct Daemon {
     dir_handles: Slab<DirHandle>,
     file_handles: Slab<FileState>,
     pending_requests: Slab<Request>,
+
+    // cache
+    attr_cache: HashMap<PathBuf, Arc<sftp::FileAttr>>,
+    dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
 }
 
 impl Daemon {
@@ -73,6 +80,8 @@ impl Daemon {
             dir_handles: Slab::new(),
             file_handles: Slab::new(),
             pending_requests: Slab::new(),
+            attr_cache: HashMap::new(),
+            dirent_cache: HashMap::new(),
         }
     }
 
@@ -82,6 +91,8 @@ impl Daemon {
                 Message::Request(req) => self.handle_request(req).await?,
                 Message::ReplyLookup(req_id, full_path, result) =>
                     self.do_reply_lookup(req_id, full_path, result).await?,
+                Message::ReplyGetattr(req_id, full_path, result) =>
+                    self.do_reply_getattr(req_id, full_path, result).await?,
                 Message::ReplyOpenDir(req_id, full_dirname, result) =>
                     self.do_reply_opendir(req_id, full_dirname, result).await?,
             }
@@ -131,13 +142,28 @@ impl Daemon {
         let full_path = self.base_dir.join(&path);
         tracing::debug!(?full_path);
 
+        if let Some(stat) = self.attr_cache.get(&full_path) {
+            tracing::debug!("hit cache");
+            let inode = self.path_table.recognize(&path);
+            inode.refcount += 1;
+
+            let mut out = EntryOut::default();
+            fill_attr(out.attr(), &stat);
+            out.ttl_attr(Duration::from_secs(60));
+            out.ttl_entry(Duration::from_secs(60));
+            out.ino(inode.ino);
+            out.attr().ino(inode.ino);
+            return req.reply(out);
+        }
+
         let req_id = self.pending_requests.insert(req.clone());
         let sftp = self.sftp.clone();
         let sender = self.sender.clone();
         let full_path = full_path.clone();
         tokio::spawn(async move {
             let result = sftp.lstat(&full_path).await;
-            sender.send(Message::ReplyLookup(req_id, full_path, result)).await.unwrap();
+            let _ = sender.send(Message::ReplyLookup(
+                req_id, full_path, result)).await;
         });
 
         Ok(())
@@ -157,6 +183,9 @@ impl Daemon {
         };
 
         tracing::debug!(?stat);
+
+        let stat = Arc::new(stat);
+        self.attr_cache.insert(full_path.clone(), stat.clone());
 
         let path = full_path.strip_prefix(&self.base_dir).unwrap();
         let inode = self.path_table.recognize(&path);
@@ -194,25 +223,53 @@ impl Daemon {
         let full_path = self.base_dir.join(path).clone();
         tracing::debug!(?full_path);
 
+        if let Some(stat) = self.attr_cache.get(&full_path) {
+            tracing::debug!("hit cache");
+            let mut out = AttrOut::default();
+            fill_attr(out.attr(), &stat);
+            out.attr().ino(op.ino());
+            out.ttl(Duration::from_secs(60));
+            return req.reply(out);
+        }
+
         let sftp = self.sftp.clone();
-        let ino = op.ino();
-        let req = req.clone();
+        let sender = self.sender.clone();
+        let req_id = self.pending_requests.insert(req.clone());
         tokio::spawn(async move {
-            match sftp.lstat(&full_path).await {
-                Ok(stat) => {
-                    let mut out = AttrOut::default();
-                    fill_attr(out.attr(), &stat);
-                    out.attr().ino(ino);
-                    out.ttl(Duration::from_secs(60));
-                    let _ = req.reply(out);
-                }
-                Err(err) => {
-                    let _ = req.reply_error(sftp_error_to_errno(&err));
-                }
-            }
+            let result = sftp.lstat(&full_path).await;
+            let _ = sender.send(Message::ReplyGetattr(
+                req_id, full_path, result)).await;
         });
 
         Ok(())
+    }
+
+    async fn do_reply_getattr(
+        &mut self,
+        req_id: usize,
+        full_path: PathBuf,
+        result: SftpResult<sftp::FileAttr>,
+    ) -> io::Result<()> {
+        let req = self.pending_requests.remove(req_id);
+
+        let stat = match result {
+            Ok(stat) => stat,
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+        };
+
+        tracing::debug!(?stat);
+
+        let stat = Arc::new(stat);
+        self.attr_cache.insert(full_path.clone(), stat.clone());
+
+        let path = full_path.strip_prefix(&self.base_dir).unwrap();
+        let ino = self.path_table.recognize(&path);
+
+        let mut out = AttrOut::default();
+        fill_attr(out.attr(), &stat);
+        out.attr().ino(ino.ino);
+        out.ttl(Duration::from_secs(60));
+        req.reply(out)
     }
 
     async fn do_readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
@@ -250,6 +307,18 @@ impl Daemon {
 
         let full_dirname = self.base_dir.join(&dirname);
         tracing::debug!(?full_dirname);
+
+        if let Some(entries) = self.dirent_cache.get(&full_dirname) {
+            tracing::debug!("hit cache");
+            let fh = self.dir_handles.insert(DirHandle {
+                entries: entries.clone()
+            }) as u64;
+            let mut out = OpenOut::default();
+            out.fh(fh);
+            //out.direct_io(true);
+            out.cache_dir(true);
+            return req.reply(out);
+        }
 
         let sftp = self.sftp.clone();
         let sender = self.sender.clone();
@@ -321,6 +390,10 @@ impl Daemon {
                     (perm & libc::S_IFMT) >> 12
                 });
 
+            let stat = Arc::new(entry.attrs);
+            let path = full_dirname.join(&entry.filename);
+            self.attr_cache.insert(path, stat);
+
             dst.push(DirEntry {
                 name: entry.filename,
                 ino,
@@ -329,11 +402,15 @@ impl Daemon {
         }
         tracing::debug!(?dst);
 
-        let fh = self.dir_handles.insert(DirHandle { entries: dst }) as u64;
+        let entries = Arc::new(dst);
+        self.dirent_cache.insert(full_dirname.clone(), entries.clone());
+
+        let fh = self.dir_handles.insert(DirHandle { entries }) as u64;
 
         let mut out = OpenOut::default();
         out.fh(fh);
-        out.direct_io(true);
+        //out.direct_io(true);
+        out.cache_dir(true);
 
         req.reply(out)
     }
@@ -410,6 +487,7 @@ impl Daemon {
 
         let mut out = OpenOut::default();
         out.fh(fh);
+        out.keep_cache(true);
 
         req.reply(out)
     }
@@ -544,7 +622,7 @@ struct FileState {
 }
 
 struct DirHandle {
-    entries: Vec<DirEntry>,
+    entries: Arc<Vec<DirEntry>>,
 }
 
 #[derive(Debug)]
