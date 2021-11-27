@@ -1,3 +1,4 @@
+mod daemon;
 mod fs;
 mod sftp;
 mod ssh;
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
     let (mut child, stream) = ssh::connect(sftp_user, sftp_host, sftp_port)
         .context("failed to establish SSH connection")?;
 
-    let (sftp, conn) = crate::sftp::init(stream)
+    let (sftp, conn) = sftp::init(stream)
         .await
         .context("failed to initialize SFTP session")?;
     tokio::spawn(conn.instrument(tracing::debug_span!("sftp_connection")));
@@ -56,7 +57,12 @@ async fn main() -> Result<()> {
     //     .context("failed to get target attribute")?;
     // ensure!(stat.is_dir(), "the target path is not directory");
 
-    fs::mount(opt, sftp).await?;
+    let (sender, daemon) = daemon::init(&opt, sftp);
+    tokio::spawn(async move {
+        let _ = daemon.run().await;
+    });
+
+    fs::mount(&opt, sender).await?;
 
     child.kill().await.context("failed to send kill")?;
     child.wait().await?;
