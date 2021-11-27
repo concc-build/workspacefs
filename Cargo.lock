@@ -503,6 +503,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-words"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fa3938c99da4914afedd13bf3d79bcb6c277d1b2c398d23257a304d9e1b074"
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,6 +540,7 @@ dependencies = [
  "futures",
  "libc",
  "polyfuse",
+ "shell-words",
  "slab",
  "structopt",
  "thiserror",

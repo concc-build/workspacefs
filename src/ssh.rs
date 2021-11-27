@@ -63,12 +63,16 @@ impl AsyncWrite for Stream {
 }
 
 pub(crate) fn connect(
+    command: &str,
     user: &str,
     host: &str,
     port: u16,
 ) -> Result<(Child, Stream)> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-sx")
+    let words = shell_words::split(command)?;
+    let (prog, args) = words.split_first().unwrap();
+    let mut cmd = Command::new(&prog);
+    cmd.args(args)
+        .arg("-sx")
         .arg("-p")
         .arg(port.to_string())
         .arg("--")

@@ -15,6 +15,12 @@ struct Opt {
     #[structopt(short, number_of_values = 1)]
     options: Vec<String>,
 
+    /// SSH command to be executed for establishing a connection.
+    ///
+    /// Additional SSH options will be added after the command string.
+    #[structopt(long, default_value = "ssh")]
+    ssh_command: String,
+
     /// Absolute path to fusermount or fusermount3.
     #[structopt(long, parse(from_os_str))]
     fusermount_path: Option<PathBuf>,
@@ -43,7 +49,8 @@ async fn main() -> Result<()> {
     let sftp_host = opt.remote.host_str().unwrap();
     let sftp_port = opt.remote.port().unwrap_or(22);
 
-    let (mut child, stream) = ssh::connect(sftp_user, sftp_host, sftp_port)
+    let (mut child, stream) = ssh::connect(
+        &opt.ssh_command, sftp_user, sftp_host, sftp_port)
         .context("failed to establish SSH connection")?;
 
     let (sftp, conn) = sftp::init(stream)
