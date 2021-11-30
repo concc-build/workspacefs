@@ -30,6 +30,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{mpsc, oneshot},
 };
+use tracing::instrument;
 
 const SFTP_PROTOCOL_VERSION: u32 = 3;
 
@@ -87,6 +88,9 @@ pub const SSH_FX_BAD_MESSAGE: u32 = 5;
 pub const SSH_FX_NO_CONNECTION: u32 = 6;
 pub const SSH_FX_CONNECTION_LOST: u32 = 7;
 pub const SSH_FX_OP_UNSUPPORTED: u32 = 8;
+
+const MAX_READ: usize = 65536;
+const MAX_WRITE: usize = 65536;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -224,17 +228,73 @@ impl Session {
     }
 
     /// Request to read a range of data from an opened file corresponding to the specified handle.
-    pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
+    #[instrument(name = "sftp.read", level = "debug", skip_all,
+                 fields(handle = ?handle.0.as_bytes(), offset, len))]
+    pub async fn read(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<(usize, Vec<Vec<u8>>), Error> {
+        let offset = offset as usize;
+        let len = len as usize;
+
+        // Read chunks in parallel.
+        let futs = (0..len as usize)
+            .step_by(MAX_READ)
+            .map(|pos| {
+                let chunk_len = if pos + MAX_READ > len {
+                    len - pos
+                } else {
+                    MAX_WRITE
+                };
+                self.read_chunk(handle, offset + pos, chunk_len)
+            });
+
+        let mut nread = 0;
+        let mut chunks = Vec::with_capacity(futs.len());
+        for result in futures::future::join_all(futs).await.into_iter() {
+            match result {
+                Ok(chunk) => {
+                    nread += chunk.len();
+                    chunks.push(chunk);
+                }
+                Err(Error::Remote(err)) if err.code() == SSH_FX_EOF => {
+                    break
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok((nread, chunks))
+    }
+
+    pub async fn read_chunk(
+        &self,
+        handle: &FileHandle,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        assert!(offset <= u64::MAX as usize);
+        assert!(len <= u32::MAX as usize);
+
+        tracing::debug!(offset, len, "reading a chunk...");
+
         let response = self
             .request(SSH_FXP_READ, |_, buf| {
                 put_string(&mut *buf, handle.0.as_bytes());
-                buf.put_u64(offset);
-                buf.put_u32(len);
+                buf.put_u64(offset as u64);
+                buf.put_u32(len as u32);
             })
             .await?;
 
         match response {
-            Response::Data(data) => Ok(data),
+            Response::Data(data) => {
+                tracing::debug!(nread = data.len());
+                Ok(data)
+            }
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
@@ -243,17 +303,57 @@ impl Session {
     }
 
     /// Request to write a range of data to an opened file corresponding to the specified handle.
-    pub async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<(), Error> {
+    #[instrument(name = "sftp.write", level = "debug", skip_all,
+                 fields(handle = ?handle.0.as_bytes(), offset, len = data.len()))]
+    pub async fn write(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        data: Bytes
+    ) -> Result<(), Error> {
+        let size = data.len();
+
+        // Write chunks in parallel.
+        let futs = (0..data.len())
+            .step_by(MAX_WRITE)
+            .map(|pos| {
+                let range = if pos + MAX_WRITE > size {
+                    pos..(size - pos)
+                } else {
+                    pos..(pos + MAX_WRITE)
+                };
+                self.write_chunk(handle, offset + pos as u64, data.slice(range))
+            });
+
+        for result in futures::future::join_all(futs).await.into_iter() {
+            if result.is_err() {
+                return result;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn write_chunk(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        data: Bytes
+    ) -> Result<(), Error> {
+        tracing::debug!(offset, len = data.len(), "writing a chunk...");
         let response = self
             .request(SSH_FXP_WRITE, |_, buf| {
                 put_string(&mut *buf, handle.0.as_bytes());
                 buf.put_u64(offset);
-                buf.put(&*data);
+                put_string(&mut *buf, &data[..]);
             })
             .await?;
 
         match response {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) if st.code == SSH_FX_OK => {
+                tracing::debug!("written");
+                Ok(())
+            }
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
@@ -262,8 +362,13 @@ impl Session {
     }
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
-    #[inline]
-    pub async fn lstat(&self, path: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
+    #[instrument(name = "sftp.lstat", level = "debug", skip_all,
+                 fields(?path))]
+    pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, Error>
+    where
+        P: AsRef<OsStr> + std::fmt::Debug,
+    {
+        tracing::debug!("start");
         let path = path.as_ref();
 
         let response = self
@@ -273,7 +378,10 @@ impl Session {
             .await?;
 
         match response {
-            Response::Attrs(attrs) => Ok(attrs),
+            Response::Attrs(attrs) => {
+                tracing::debug!("done");
+                Ok(attrs)
+            }
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
@@ -613,17 +721,24 @@ impl Inner {
         // FIXME: choose appropriate atomic ordering.
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
 
+        // TODO: Slow. Use [IoSlice; 3] and avoid data copy as much as possible.
+        //
+        //  IoSlice[0] .. header(length, type, id)
+        //  IoSlice[1] .. params
+        //  IoSlice[2] .. data buffer
+        //
         let mut buf = vec![];
         buf.put_u8(packet_type);
         buf.put_u32(id);
         f(self, &mut buf);
 
+        let (tx, rx) = oneshot::channel();
+        // The pending request MUST be registered before sending the buffer.
+        self.pending_requests.insert(id, tx);
+
         self.incoming_requests.send(buf).map_err(|_| {
             io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
         })?;
-
-        let (tx, rx) = oneshot::channel();
-        self.pending_requests.insert(id, tx);
 
         rx.await.map_err(|_| Error::SessionClosed)
     }

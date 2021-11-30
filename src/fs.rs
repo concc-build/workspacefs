@@ -25,6 +25,8 @@ pub(crate) async fn mount(opt: &Opt, sender: Sender<Message>) -> Result<()> {
         if let Some(ref fusermount_path) = opt.fusermount_path {
             config.fusermount_path(fusermount_path);
         }
+        // SFTP only supports 1-second time resolution.
+        config.time_gran(1000000000);
         config
     })
     .await

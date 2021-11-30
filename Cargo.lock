@@ -22,9 +22,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.48"
+version = "1.0.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e1f47f7dc0422027a4e370dd4548d4d66b26782e513e98dca1e689e058a80e"
+checksum = "0a03e93e97a28fbc9f42fbc5ba0886a3c67eb637b476dbee711f80a6ffe8223d"
 
 [[package]]
 name = "atty"
@@ -394,7 +394,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "polyfuse"
 version = "0.4.1"
-source = "git+https://github.com/masnagam/polyfuse.git#1ebb2115d4ff02cf4b49ee3a80a52a25b1d70027"
+source = "git+https://github.com/masnagam/polyfuse.git#2f83ff02e7b2c03f19ea89eeca612a57bb4e35d4"
 dependencies = [
  "bytes",
  "either",
@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "polyfuse-kernel"
 version = "0.1.0"
-source = "git+https://github.com/masnagam/polyfuse.git#1ebb2115d4ff02cf4b49ee3a80a52a25b1d70027"
+source = "git+https://github.com/masnagam/polyfuse.git#2f83ff02e7b2c03f19ea89eeca612a57bb4e35d4"
 dependencies = [
  "zerocopy",
 ]
