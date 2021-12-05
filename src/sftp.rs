@@ -28,9 +28,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    process::Child,
     sync::{mpsc, oneshot},
 };
 use tracing::instrument;
+use tracing::Instrument as _;
+use crate::ssh;
 
 const SFTP_PROTOCOL_VERSION: u32 = 3;
 
@@ -744,10 +747,10 @@ impl Inner {
     }
 }
 
-#[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Connection<T> {
-    stream: T,
+pub struct Connection {
+    child: Child,
+    stream: ssh::Stream,
     inner: Arc<Inner>,
     incoming_requests: mpsc::UnboundedReceiver<Vec<u8>>,
     send: SendRequest,
@@ -776,10 +779,7 @@ enum RecvResponse {
     },
 }
 
-impl<T> Future for Connection<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
+impl Future for Connection {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
@@ -797,10 +797,7 @@ where
     }
 }
 
-impl<T> Connection<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
+impl Connection {
     fn poll_send(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
         let mut w = Pin::new(&mut self.stream);
 
@@ -1001,11 +998,18 @@ struct RemoteStatus {
 /// Start a SFTP session on the provided transport I/O.
 ///
 /// This is a shortcut to `InitSession::default().init(r, w)`.
-pub async fn init<T>(stream: T) -> Result<(Session, Connection<T>), Error>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    InitSession::default().init(stream).await
+pub async fn init(
+    ssh_command: &str,
+    user: &str,
+    host: &str,
+    port: u16,
+) -> Result<Session, Error> {
+    let (child, stream) = ssh::connect(ssh_command, user, host, port)
+        .expect("failed to establish SSH connection");
+    let (se, conn) = InitSession::default().init(child, stream).await?;
+    tokio::spawn(
+        conn.instrument(tracing::debug_span!("sftp_connection")));
+    Ok(se)
 }
 
 #[derive(Debug)]
@@ -1048,10 +1052,11 @@ impl InitSession {
     /// the settings of SFTP protocol to use.  When the initialization process is
     /// successed, it returns a handle to send subsequent SFTP requests from the
     /// client and objects to drive the underlying communication with the server.
-    pub async fn init<T>(&self, stream: T) -> Result<(Session, Connection<T>), Error>
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
+    async fn init(
+        &self,
+        child: Child,
+        stream: ssh::Stream
+    ) -> Result<(Session, Connection), Error> {
         let mut stream = stream;
 
         // send SSH_FXP_INIT packet.
@@ -1120,6 +1125,7 @@ impl InitSession {
         };
 
         let conn = Connection {
+            child,
             stream,
             inner,
             incoming_requests: rx,

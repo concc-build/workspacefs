@@ -6,7 +6,6 @@ mod ssh;
 use anyhow::{ensure, Context as _, Result};
 use std::path::PathBuf;
 use structopt::StructOpt;
-use tracing::Instrument as _;
 use url::Url;
 
 #[derive(Debug, StructOpt)]
@@ -49,14 +48,10 @@ async fn main() -> Result<()> {
     let sftp_host = opt.remote.host_str().unwrap();
     let sftp_port = opt.remote.port().unwrap_or(22);
 
-    let (mut child, stream) = ssh::connect(
+    let sftp = sftp::init(
         &opt.ssh_command, sftp_user, sftp_host, sftp_port)
-        .context("failed to establish SSH connection")?;
-
-    let (sftp, conn) = sftp::init(stream)
         .await
         .context("failed to initialize SFTP session")?;
-    tokio::spawn(conn.instrument(tracing::debug_span!("sftp_connection")));
 
     // let stat = sftp
     //     .lstat(&args.base_dir)
@@ -70,9 +65,6 @@ async fn main() -> Result<()> {
     });
 
     fs::mount(&opt, sender).await?;
-
-    child.kill().await.context("failed to send kill")?;
-    child.wait().await?;
 
     Ok(())
 }
