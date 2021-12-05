@@ -20,11 +20,8 @@ use std::{
         Arc, Weak,
     },
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Child,
-    sync::{mpsc, oneshot},
-};
+use std::io::IoSlice;
+use tokio::{io::{AsyncReadExt, AsyncWrite, AsyncWriteExt}, process::Child, sync::{mpsc, oneshot}};
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::task::JoinHandle;
@@ -156,6 +153,74 @@ impl FileAttr {
     pub fn mtime(&self) -> Option<u32> {
         self.ac_mod_time.map(|(_, mtime)| mtime)
     }
+
+    fn count_bytes(&self) -> usize {
+        let mut n = 4;
+        if self.size.is_some() {
+            n += 8
+        }
+        if self.uid_gid.is_some() {
+            n += 8;
+        }
+        if self.permissions.is_some() {
+            n += 4;
+        }
+        if self.ac_mod_time.is_some() {
+            n += 8;
+        }
+        if !self.extended.is_empty() {
+            n += 4;
+            for (typ, data) in &self.extended {
+                n += 4 + typ.as_bytes().len();
+                n += 4 + data.as_bytes().len();
+            }
+        }
+        n
+    }
+
+    fn put_bytes<B>(&self, mut b: B)
+    where
+        B: BufMut,
+    {
+        #[inline(always)]
+        fn flag(b: bool, flag: u32) -> u32 {
+            if b {
+                flag
+            } else {
+                0
+            }
+        }
+
+        let flags = flag(self.size.is_some(), SSH_FILEXFER_ATTR_SIZE)
+            | flag(self.uid_gid.is_some(), SSH_FILEXFER_ATTR_UIDGID)
+            | flag(self.permissions.is_some(), SSH_FILEXFER_ATTR_PERMISSIONS)
+            | flag(self.ac_mod_time.is_some(), SSH_FILEXFER_ATTR_ACMODTIME);
+
+        b.put_u32(flags);
+        if let Some(size) = self.size {
+            b.put_u64(size);
+        }
+        if let Some((uid, gid)) = self.uid_gid {
+            b.put_u32(uid);
+            b.put_u32(gid);
+        }
+        if let Some(perm) = self.permissions {
+            b.put_u32(perm);
+        }
+        if let Some((atime, mtime)) = self.ac_mod_time {
+            b.put_u32(atime);
+            b.put_u32(mtime);
+        }
+        if !self.extended.is_empty() {
+            b.put_u32(self.extended.len() as u32);
+            for (typ, data) in &self.extended {
+                b.put_u32(typ.as_bytes().len() as u32);
+                b.put(typ.as_bytes());
+                b.put_u32(data.as_bytes().len() as u32);
+                b.put(data.as_bytes());
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,32 +241,35 @@ pub struct Session {
 }
 
 impl Session {
-    async fn request<F>(&self, packet_type: u8, f: F) -> Result<Response, Error>
-    where
-        F: FnOnce(&Inner, &mut Vec<u8>),
-    {
+    async fn request(
+        &self,
+        packet_type: u8,
+        payload: Vec<Bytes>,
+    ) -> Result<Response, Error> {
         let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
-        inner.send_request(packet_type, f).await
+        inner.send_request(packet_type, payload).await
     }
 
     /// Request to open a file.
-    pub async fn open(
+    pub async fn open<P>(
         &self,
-        filename: impl AsRef<OsStr>,
+        filename: P,
         pflags: OpenFlag,
         attrs: &FileAttr,
-    ) -> Result<FileHandle, Error> {
-        let filename = filename.as_ref();
+    ) -> Result<FileHandle, Error>
+    where
+        P: AsRef<OsStr>,
+    {
+        let filename = filename.as_ref().as_bytes();
+        let len = 8 + filename.len() + attrs.count_bytes();
 
-        let response = self
-            .request(SSH_FXP_OPEN, |_, buf| {
-                put_string(&mut *buf, filename.as_bytes());
-                buf.put_u32(pflags.bits());
-                put_attrs(&mut *buf, attrs);
-            })
-            .await?;
+        let mut payload = BytesMut::with_capacity(len);
+        payload.put_u32(filename.len() as u32);
+        payload.put(filename);
+        payload.put_u32(pflags.bits());
+        attrs.put_bytes(&mut payload);
 
-        match response {
+        match self.request(SSH_FXP_OPEN, vec![payload.freeze()]).await? {
             Response::Handle(handle) => Ok(handle),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -212,13 +280,13 @@ impl Session {
 
     /// Request to close a file corresponding to the specified handle.
     pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
-        let response = self
-            .request(SSH_FXP_CLOSE, |_, buf| {
-                put_string(&mut *buf, handle.0.as_bytes());
-            })
-            .await?;
+        let len = 4 + handle.0.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(len);
+        payload.put_u32(handle.0.as_bytes().len() as u32);
+        payload.put(handle.0.as_bytes());
+
+        match self.request(SSH_FXP_CLOSE, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -282,15 +350,15 @@ impl Session {
 
         tracing::debug!(offset, len, "reading a chunk...");
 
-        let response = self
-            .request(SSH_FXP_READ, |_, buf| {
-                put_string(&mut *buf, handle.0.as_bytes());
-                buf.put_u64(offset as u64);
-                buf.put_u32(len as u32);
-            })
-            .await?;
+        let payload_len = 16 + handle.0.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(handle.0.as_bytes().len() as u32);
+        payload.put(handle.0.as_bytes());
+        payload.put_u64(offset as u64);
+        payload.put_u32(len as u32);
+
+        match self.request(SSH_FXP_READ, vec![payload.freeze()]).await? {
             Response::Data(data) => {
                 tracing::debug!(nread = data.len());
                 Ok(data)
@@ -341,15 +409,16 @@ impl Session {
         data: Bytes
     ) -> Result<(), Error> {
         tracing::debug!(offset, len = data.len(), "writing a chunk...");
-        let response = self
-            .request(SSH_FXP_WRITE, |_, buf| {
-                put_string(&mut *buf, handle.0.as_bytes());
-                buf.put_u64(offset);
-                put_string(&mut *buf, &data[..]);
-            })
-            .await?;
 
-        match response {
+        let params_len = 16 + handle.0.as_bytes().len();
+
+        let mut params = BytesMut::with_capacity(params_len);
+        params.put_u32(handle.0.as_bytes().len() as u32);
+        params.put(handle.0.as_bytes());
+        params.put_u64(offset as u64);
+        params.put_u32(data.len() as u32);
+
+        match self.request(SSH_FXP_WRITE, vec![params.freeze(), data]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => {
                 tracing::debug!("written");
                 Ok(())
@@ -371,13 +440,13 @@ impl Session {
         tracing::debug!("start");
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_LSTAT, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_LSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => {
                 tracing::debug!("done");
                 Ok(attrs)
@@ -392,13 +461,13 @@ impl Session {
     /// Request to retrieve attribute values for a named file.
     #[inline]
     pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
-        let response = self
-            .request(SSH_FXP_FSTAT, |_, buf| {
-                put_string(&mut *buf, handle.0.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + handle.0.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(handle.0.as_bytes().len() as u32);
+        payload.put(handle.0.as_bytes());
+
+        match self.request(SSH_FXP_FSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -407,17 +476,20 @@ impl Session {
         }
     }
 
-    pub async fn setstat(&self, path: impl AsRef<OsStr>, attrs: &FileAttr) -> Result<(), Error> {
+    pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_SETSTAT, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-                put_attrs(&mut *buf, attrs);
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len() + attrs.count_bytes();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+        attrs.put_bytes(&mut payload);
+
+        match self.request(SSH_FXP_SETSTAT, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -427,14 +499,14 @@ impl Session {
     }
 
     pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), Error> {
-        let response = self
-            .request(SSH_FXP_FSETSTAT, |_, buf| {
-                put_string(&mut *buf, handle.0.as_bytes());
-                put_attrs(&mut *buf, attrs);
-            })
-            .await?;
+        let payload_len = 4 + handle.0.as_bytes().len() + attrs.count_bytes();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(handle.0.as_bytes().len() as u32);
+        payload.put(handle.0.as_bytes());
+        attrs.put_bytes(&mut payload);
+
+        match self.request(SSH_FXP_FSETSTAT, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -444,16 +516,19 @@ impl Session {
     }
 
     /// Request to open a directory for reading.
-    pub async fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle, Error> {
+    pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_OPENDIR, |_, buf| {
-                put_string(buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_OPENDIR, vec![payload.freeze()]).await? {
             Response::Handle(handle) => Ok(handle),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -464,13 +539,13 @@ impl Session {
 
     /// Request to list files and directories contained in an opened directory.
     pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
-        let response = self
-            .request(SSH_FXP_READDIR, |_, buf| {
-                put_string(buf, handle.0.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + handle.0.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(handle.0.as_bytes().len() as u32);
+        payload.put(handle.0.as_bytes());
+
+        match self.request(SSH_FXP_READDIR, vec![payload.freeze()]).await? {
             Response::Name(entries) => Ok(entries),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -479,16 +554,19 @@ impl Session {
         }
     }
 
-    pub async fn remove(&self, filename: impl AsRef<OsStr>) -> Result<(), Error> {
+    pub async fn remove<P>(&self, filename: P) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let filename = filename.as_ref();
 
-        let response = self
-            .request(SSH_FXP_REMOVE, |_, buf| {
-                put_string(&mut *buf, filename.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + filename.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(filename.as_bytes().len() as u32);
+        payload.put(filename.as_bytes());
+
+        match self.request(SSH_FXP_REMOVE, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -497,17 +575,20 @@ impl Session {
         }
     }
 
-    pub async fn mkdir(&self, path: impl AsRef<OsStr>, attrs: &FileAttr) -> Result<(), Error> {
+    pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_MKDIR, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-                put_attrs(&mut *buf, attrs);
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len() + attrs.count_bytes();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+        attrs.put_bytes(&mut payload);
+
+        match self.request(SSH_FXP_MKDIR, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -516,16 +597,19 @@ impl Session {
         }
     }
 
-    pub async fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<(), Error> {
+    pub async fn rmdir<P>(&self, path: P) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_RMDIR, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_RMDIR, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -534,16 +618,19 @@ impl Session {
         }
     }
 
-    pub async fn realpath(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
+    pub async fn realpath<P>(&self, path: P) -> Result<OsString, Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_REALPATH, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_REALPATH, vec![payload.freeze()]).await? {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -554,16 +641,19 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn stat(&self, path: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
+    pub async fn stat<P>(&self, path: P) -> Result<FileAttr, Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_STAT, |_, buf| {
-                put_string(buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_STAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -572,22 +662,22 @@ impl Session {
         }
     }
 
-    pub async fn rename(
-        &self,
-        oldpath: impl AsRef<OsStr>,
-        newpath: impl AsRef<OsStr>,
-    ) -> Result<(), Error> {
+    pub async fn rename<P>(&self, oldpath: P, newpath: P,) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let oldpath = oldpath.as_ref();
         let newpath = newpath.as_ref();
 
-        let response = self
-            .request(SSH_FXP_RENAME, |_, buf| {
-                put_string(&mut *buf, oldpath.as_bytes());
-                put_string(&mut *buf, newpath.as_bytes());
-            })
-            .await?;
+        let payload_len = 8 + oldpath.as_bytes().len() + newpath.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(oldpath.as_bytes().len() as u32);
+        payload.put(oldpath.as_bytes());
+        payload.put_u32(newpath.as_bytes().len() as u32);
+        payload.put(newpath.as_bytes());
+
+        match self.request(SSH_FXP_RENAME, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -596,16 +686,19 @@ impl Session {
         }
     }
 
-    pub async fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
+    pub async fn readlink<P>(&self, path: P) -> Result<OsString, Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let path = path.as_ref();
 
-        let response = self
-            .request(SSH_FXP_READLINK, |_, buf| {
-                put_string(&mut *buf, path.as_bytes());
-            })
-            .await?;
+        let payload_len = 4 + path.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(path.as_bytes().len() as u32);
+        payload.put(path.as_bytes());
+
+        match self.request(SSH_FXP_READLINK, vec![payload.freeze()]).await? {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -614,27 +707,32 @@ impl Session {
         }
     }
 
-    pub async fn symlink(
-        &self,
-        linkpath: impl AsRef<OsStr>,
-        targetpath: impl AsRef<OsStr>,
-    ) -> Result<(), Error> {
+    pub async fn symlink<P>(&self, linkpath: P, targetpath: P) -> Result<(), Error>
+    where
+        P: AsRef<OsStr>,
+    {
         let linkpath = linkpath.as_ref();
         let targetpath = targetpath.as_ref();
 
-        let response = self
-            .request(SSH_FXP_SYMLINK, |inner, buf| {
-                if inner.reverse_symlink_arguments {
-                    put_string(&mut *buf, targetpath.as_bytes());
-                    put_string(&mut *buf, linkpath.as_bytes());
-                } else {
-                    put_string(&mut *buf, linkpath.as_bytes());
-                    put_string(&mut *buf, targetpath.as_bytes());
-                }
-            })
-            .await?;
+        let payload_len = 8 + linkpath.as_bytes().len() + targetpath.as_bytes().len();
 
-        match response {
+        let reverse_symlink_arguments = self.inner
+            .upgrade().ok_or(Error::SessionClosed)?.reverse_symlink_arguments;
+
+        let mut payload = BytesMut::with_capacity(payload_len);
+        if reverse_symlink_arguments {
+            payload.put_u32(targetpath.as_bytes().len() as u32);
+            payload.put(targetpath.as_bytes());
+            payload.put_u32(linkpath.as_bytes().len() as u32);
+            payload.put(linkpath.as_bytes());
+        } else {
+            payload.put_u32(linkpath.as_bytes().len() as u32);
+            payload.put(linkpath.as_bytes());
+            payload.put_u32(targetpath.as_bytes().len() as u32);
+            payload.put(targetpath.as_bytes());
+        }
+
+        match self.request(SSH_FXP_SYMLINK, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -643,21 +741,19 @@ impl Session {
         }
     }
 
-    pub async fn extended(
-        &self,
-        request: impl AsRef<OsStr>,
-        data: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    pub async fn extended<R>(&self, request: R, data: Bytes) -> Result<Vec<u8>, Error>
+    where
+        R: AsRef<OsStr>,
+    {
         let request = request.as_ref();
 
-        let response = self
-            .request(SSH_FXP_EXTENDED, |_, buf| {
-                put_string(&mut *buf, request.as_bytes());
-                buf.put(data);
-            })
-            .await?;
+        let payload_len = 4 + request.as_bytes().len();
 
-        match response {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        payload.put_u32(request.as_bytes().len() as u32);
+        payload.put(request.as_bytes());
+
+        match self.request(SSH_FXP_EXTENDED, vec![payload.freeze(), data]).await? {
             Response::Extended(data) => Ok(data.to_vec()),
             Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -708,35 +804,37 @@ bitflags::bitflags! {
 struct Inner {
     extensions: Vec<(OsString, OsString)>,
     reverse_symlink_arguments: bool,
-    incoming_requests: mpsc::UnboundedSender<Vec<u8>>,
+    incoming_requests: mpsc::UnboundedSender<Vec<Bytes>>,
     pending_requests: DashMap<u32, oneshot::Sender<Response>>,
     next_request_id: AtomicU32,
 }
 
 impl Inner {
-    async fn send_request<F>(&self, packet_type: u8, f: F) -> Result<Response, Error>
-    where
-        F: FnOnce(&Inner, &mut Vec<u8>),
-    {
+    async fn send_request(
+        &self,
+        packet_type: u8,
+        mut payload: Vec<Bytes>,
+    ) -> Result<Response, Error> {
         // FIXME: choose appropriate atomic ordering.
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
 
-        // TODO: Slow. Use [IoSlice; 3] and avoid data copy as much as possible.
-        //
-        //  IoSlice[0] .. header(length, type, id)
-        //  IoSlice[1] .. params
-        //  IoSlice[2] .. data buffer
-        //
-        let mut buf = vec![];
-        buf.put_u8(packet_type);
-        buf.put_u32(id);
-        f(self, &mut buf);
+        let data_len = payload.iter().fold(5, |a, v| a + v.len());
+        tracing::debug!(?packet_type, ?data_len);
+
+        let mut header = BytesMut::with_capacity(9);
+        header.put_u32(data_len as u32);
+        header.put_u8(packet_type);
+        header.put_u32(id);
+
+        let mut iovec = Vec::with_capacity(1 + payload.len());
+        iovec.push(header.freeze());
+        iovec.append(&mut payload);
 
         let (tx, rx) = oneshot::channel();
         // The pending request MUST be registered before sending the buffer.
         self.pending_requests.insert(id, tx);
 
-        self.incoming_requests.send(buf).map_err(|_| {
+        self.incoming_requests.send(iovec).map_err(|_| {
             io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
         })?;
 
@@ -900,7 +998,7 @@ impl InitSession {
             extensions.push((name, data));
         }
 
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<Bytes>>();
 
         let inner = Arc::new(Inner {
             extensions,
@@ -932,12 +1030,27 @@ impl InitSession {
 
 async fn send_loop(
     mut writer: ChildStdin,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>
+    mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>
 ) -> Result<(), Error> {
-    while let Some(packet) = rx.recv().await {
-        writer.write_u32(packet.len() as u32).await?;
-        writer.write_all(&packet[..]).await?;
+    while let Some(iovec) = rx.recv().await {
+        let nwritten = if writer.is_write_vectored() {
+            tracing::debug!("Sending with write_vectored...");
+            let mut slices: Vec<IoSlice<'_>> = iovec
+                .iter()
+                .map(|buf| IoSlice::new(buf.as_ref()))
+                .collect();
+            writer.write_vectored(&mut slices).await?
+        } else {
+            tracing::debug!("Sending with write_all...");
+            let mut nwritten = 0;
+            for buf in iovec.into_iter() {
+                nwritten += buf.len();
+                writer.write_all(&buf[..]).await?;
+            }
+            nwritten
+        };
         writer.flush().await?;
+        tracing::debug!("Sent {} bytes", nwritten);
     }
 
     Ok(())
@@ -1024,49 +1137,6 @@ where
 {
     b.put_u32(s.len() as u32);
     b.put(s);
-}
-
-fn put_attrs<B>(mut b: B, attrs: &FileAttr)
-where
-    B: BufMut,
-{
-    #[inline(always)]
-    fn flag(b: bool, flag: u32) -> u32 {
-        if b {
-            flag
-        } else {
-            0
-        }
-    }
-
-    let flags = flag(attrs.size.is_some(), SSH_FILEXFER_ATTR_SIZE)
-        | flag(attrs.uid_gid.is_some(), SSH_FILEXFER_ATTR_UIDGID)
-        | flag(attrs.permissions.is_some(), SSH_FILEXFER_ATTR_PERMISSIONS)
-        | flag(attrs.ac_mod_time.is_some(), SSH_FILEXFER_ATTR_ACMODTIME)
-        | flag(!attrs.extended.is_empty(), SSH_FILEXFER_ATTR_EXTENDED);
-
-    b.put_u32(flags);
-    if let Some(size) = attrs.size {
-        b.put_u64(size);
-    }
-    if let Some((uid, gid)) = attrs.uid_gid {
-        b.put_u32(uid);
-        b.put_u32(gid);
-    }
-    if let Some(perm) = attrs.permissions {
-        b.put_u32(perm);
-    }
-    if let Some((atime, mtime)) = attrs.ac_mod_time {
-        b.put_u32(atime);
-        b.put_u32(mtime);
-    }
-    if !attrs.extended.is_empty() {
-        b.put_u32(attrs.extended.len() as u32);
-        for (typ, data) in &attrs.extended {
-            put_string(&mut b, typ.as_bytes());
-            put_string(&mut b, data.as_bytes());
-        }
-    }
 }
 
 #[inline]
