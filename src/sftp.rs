@@ -9,28 +9,25 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
-use futures::{
-    future::Future,
-    ready,
-    task::{self, Poll},
-};
 use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
     io,
-    mem::{self, MaybeUninit},
+    mem,
     os::unix::prelude::*,
-    pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Weak,
     },
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncReadExt, AsyncWriteExt},
     process::Child,
     sync::{mpsc, oneshot},
 };
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
+use tokio::task::JoinHandle;
 use tracing::instrument;
 use tracing::Instrument as _;
 use crate::ssh;
@@ -321,7 +318,7 @@ impl Session {
             .step_by(MAX_WRITE)
             .map(|pos| {
                 let range = if pos + MAX_WRITE > size {
-                    pos..(size - pos)
+                    pos..size
                 } else {
                     pos..(pos + MAX_WRITE)
                 };
@@ -750,217 +747,9 @@ impl Inner {
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Connection {
     child: Child,
-    stream: ssh::Stream,
     inner: Arc<Inner>,
-    incoming_requests: mpsc::UnboundedReceiver<Vec<u8>>,
-    send: SendRequest,
-    recv: RecvResponse,
-}
-
-#[derive(Debug)]
-enum SendRequest {
-    Waiting,
-    Writing {
-        packet: bytes::buf::Chain<io::Cursor<[u8; 4]>, io::Cursor<Vec<u8>>>,
-    },
-    Closed,
-}
-
-#[derive(Debug)]
-enum RecvResponse {
-    ReadLength {
-        buf: [u8; 4],
-        filled: usize,
-    },
-    ReadPacket {
-        buf: BytesMut,
-        inited: usize,
-        filled: usize,
-    },
-}
-
-impl Future for Connection {
-    type Output = Result<(), Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let me = self.get_mut();
-
-        // FIXME: gracefully shutdown
-        let send = me.poll_send(cx)?;
-        let recv = me.poll_recv(cx)?;
-
-        if send.is_ready() && recv.is_ready() {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-impl Connection {
-    fn poll_send(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let mut w = Pin::new(&mut self.stream);
-
-        loop {
-            match &mut self.send {
-                SendRequest::Waiting => match ready!(self.incoming_requests.poll_recv(cx)) {
-                    Some(packet) => {
-                        let length = packet.len() as u32;
-                        self.send = SendRequest::Writing {
-                            packet: Buf::chain(
-                                io::Cursor::new(length.to_be_bytes()),
-                                io::Cursor::new(packet),
-                            ),
-                        };
-                    }
-                    None => {
-                        self.send = SendRequest::Closed;
-                        return Poll::Ready(Ok(()));
-                    }
-                },
-
-                SendRequest::Writing { packet } => {
-                    while packet.remaining() > 0 {
-                        let written = ready!(w.as_mut().poll_write(cx, packet.chunk()))?;
-                        packet.advance(written);
-                    }
-                    ready!(w.as_mut().poll_flush(cx))?;
-                    self.send = SendRequest::Waiting;
-                }
-
-                SendRequest::Closed => return Poll::Ready(Ok(())),
-            }
-        }
-    }
-
-    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let mut r = Pin::new(&mut self.stream);
-
-        loop {
-            match &mut self.recv {
-                RecvResponse::ReadLength { buf, filled } => {
-                    let mut read_buf = ReadBuf::new(buf);
-                    read_buf.set_filled(*filled);
-                    while read_buf.remaining() > 0 {
-                        let res = r.as_mut().poll_read(cx, &mut read_buf);
-                        *filled = read_buf.filled().len();
-                        ready!(res)?;
-                    }
-
-                    let length = u32::from_be_bytes(*buf);
-                    let buf = BytesMut::with_capacity(length as usize);
-                    self.recv = RecvResponse::ReadPacket {
-                        buf,
-                        inited: 0,
-                        filled: 0,
-                    };
-                }
-
-                RecvResponse::ReadPacket {
-                    buf,
-                    inited,
-                    filled,
-                } => {
-                    let mut read_buf = unsafe {
-                        let mut b = ReadBuf::uninit(std::slice::from_raw_parts_mut(
-                            buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                            buf.capacity(),
-                        ));
-                        b.assume_init(*inited);
-                        b.set_filled(*filled);
-                        b
-                    };
-
-                    while read_buf.remaining() > 0 {
-                        let res = r.as_mut().poll_read(cx, &mut read_buf);
-                        *inited = read_buf.initialized().len();
-                        *filled = read_buf.filled().len();
-                        ready!(res)?;
-                    }
-
-                    unsafe {
-                        buf.set_len(buf.capacity());
-                    }
-
-                    match std::mem::replace(
-                        &mut self.recv,
-                        RecvResponse::ReadLength {
-                            buf: [0u8; 4],
-                            filled: 0,
-                        },
-                    ) {
-                        RecvResponse::ReadPacket { buf, .. } => {
-                            let mut packet = buf.freeze();
-
-                            let typ = read_u8(&mut packet)?;
-                            let id = read_u32(&mut packet)?;
-
-                            let response = match typ {
-                                SSH_FXP_STATUS => {
-                                    let code = read_u32(&mut packet)?;
-                                    let message = read_string(&mut packet)?;
-                                    let language_tag = read_string(&mut packet)?;
-                                    Response::Status(RemoteStatus {
-                                        code,
-                                        message,
-                                        language_tag,
-                                    })
-                                }
-
-                                SSH_FXP_HANDLE => {
-                                    let handle = read_string(&mut packet)?;
-                                    Response::Handle(FileHandle(handle.into_boxed_os_str().into()))
-                                }
-
-                                SSH_FXP_DATA => {
-                                    let data = read_string(&mut packet)?;
-                                    Response::Data(data.into_vec())
-                                }
-
-                                SSH_FXP_ATTRS => {
-                                    let attrs = read_file_attr(&mut packet)?;
-                                    Response::Attrs(attrs)
-                                }
-
-                                SSH_FXP_NAME => {
-                                    let count = read_u32(&mut packet)?;
-                                    let mut entries = Vec::with_capacity(count as usize);
-                                    for _ in 0..count {
-                                        let filename = read_string(&mut packet)?;
-                                        let longname = read_string(&mut packet)?;
-                                        let attrs = read_file_attr(&mut packet)?;
-                                        entries.push(DirEntry {
-                                            filename,
-                                            longname,
-                                            attrs,
-                                        });
-                                    }
-                                    Response::Name(entries)
-                                }
-
-                                SSH_FXP_EXTENDED_REPLY => {
-                                    let data = packet.split_to(packet.len());
-                                    Response::Extended(data)
-                                }
-
-                                typ => {
-                                    let data = packet.split_to(packet.len());
-                                    Response::Unknown { typ, data }
-                                }
-                            };
-
-                            debug_assert!(packet.is_empty());
-
-                            if let Some((_id, tx)) = self.inner.pending_requests.remove(&id) {
-                                let _ = tx.send(response);
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-        }
-    }
+    send_task: JoinHandle<()>,
+    recv_task: JoinHandle<()>,
 }
 
 /// The kind of response values received from the server.
@@ -1004,11 +793,12 @@ pub async fn init(
     host: &str,
     port: u16,
 ) -> Result<Session, Error> {
-    let (child, stream) = ssh::connect(ssh_command, user, host, port)
+    let child = ssh::connect(ssh_command, user, host, port)
         .expect("failed to establish SSH connection");
-    let (se, conn) = InitSession::default().init(child, stream).await?;
-    tokio::spawn(
-        conn.instrument(tracing::debug_span!("sftp_connection")));
+    let conn = InitSession::default().init(child).await?;
+    let se = Session {
+        inner: Arc::downgrade(&conn.inner),
+    };
     Ok(se)
 }
 
@@ -1054,10 +844,10 @@ impl InitSession {
     /// client and objects to drive the underlying communication with the server.
     async fn init(
         &self,
-        child: Child,
-        stream: ssh::Stream
-    ) -> Result<(Session, Connection), Error> {
-        let mut stream = stream;
+        mut child: Child,
+    ) -> Result<Connection, Error> {
+        let mut reader = child.stdout.take().expect("missing stdout pipe");
+        let mut writer = child.stdin.take().expect("missing stdin pipe");
 
         // send SSH_FXP_INIT packet.
         let packet = {
@@ -1071,20 +861,20 @@ impl InitSession {
             buf
         };
         let length = packet.len() as u32;
-        stream.write_all(&length.to_be_bytes()).await?;
-        stream.write_all(&packet[..]).await?;
-        stream.flush().await?;
+        writer.write_all(&length.to_be_bytes()).await?;
+        writer.write_all(&packet[..]).await?;
+        writer.flush().await?;
 
         // receive SSH_FXP_VERSION packet.
         let length = {
             let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf[..]).await?;
+            reader.read_exact(&mut buf[..]).await?;
             u32::from_be_bytes(buf)
         };
 
         let packet = {
             let mut buf = vec![0u8; length as usize];
-            stream.read_exact(&mut buf[..]).await?;
+            reader.read_exact(&mut buf[..]).await?;
             buf
         };
         let mut packet = &packet[..];
@@ -1110,7 +900,7 @@ impl InitSession {
             extensions.push((name, data));
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         let inner = Arc::new(Inner {
             extensions,
@@ -1120,23 +910,108 @@ impl InitSession {
             next_request_id: AtomicU32::new(0),
         });
 
-        let session = Session {
-            inner: Arc::downgrade(&inner),
-        };
+        let send_task = tokio::spawn(async move {
+            let _ = send_loop(writer, rx).await;
+        });
+
+        let x = inner.clone();
+        let recv_task = tokio::spawn(async move {
+            let _ = recv_loop(reader, x).await;
+        });
 
         let conn = Connection {
             child,
-            stream,
             inner,
-            incoming_requests: rx,
-            send: SendRequest::Waiting,
-            recv: RecvResponse::ReadLength {
-                buf: [0u8; 4],
-                filled: 0,
-            },
+            send_task,
+            recv_task,
         };
 
-        Ok((session, conn))
+        Ok(conn)
+    }
+}
+
+async fn send_loop(
+    mut writer: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>
+) -> Result<(), Error> {
+    while let Some(packet) = rx.recv().await {
+        writer.write_u32(packet.len() as u32).await?;
+        writer.write_all(&packet[..]).await?;
+        writer.flush().await?;
+    }
+
+    Ok(())
+}
+
+async fn recv_loop(
+    mut reader: ChildStdout,
+    inner: Arc<Inner>
+) -> Result<(), Error> {
+    loop {
+        let length = reader.read_u32().await? as usize;
+
+        let mut buf = BytesMut::with_capacity(length);
+        unsafe {
+            buf.set_len(length);
+        }
+
+        reader.read_exact(&mut buf[..]).await?;
+
+        let mut packet = buf.freeze();
+        let typ = read_u8(&mut packet)?;
+        let id = read_u32(&mut packet)?;
+        let response = match typ {
+            SSH_FXP_STATUS => {
+                let code = read_u32(&mut packet)?;
+                let message = read_string(&mut packet)?;
+                let language_tag = read_string(&mut packet)?;
+                Response::Status(RemoteStatus {
+                    code,
+                    message,
+                    language_tag,
+                })
+            }
+            SSH_FXP_HANDLE => {
+                let handle = read_string(&mut packet)?;
+                Response::Handle(FileHandle(handle.into_boxed_os_str().into()))
+            }
+            SSH_FXP_DATA => {
+                let data = read_string(&mut packet)?;
+                Response::Data(data.into_vec())
+            }
+            SSH_FXP_ATTRS => {
+                let attrs = read_file_attr(&mut packet)?;
+                Response::Attrs(attrs)
+            }
+            SSH_FXP_NAME => {
+                let count = read_u32(&mut packet)?;
+                let mut entries = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let filename = read_string(&mut packet)?;
+                    let longname = read_string(&mut packet)?;
+                    let attrs = read_file_attr(&mut packet)?;
+                    entries.push(DirEntry {
+                        filename,
+                        longname,
+                        attrs,
+                    });
+                }
+                Response::Name(entries)
+            }
+            SSH_FXP_EXTENDED_REPLY => {
+                let data = packet.split_to(packet.len());
+                Response::Extended(data)
+            }
+            typ => {
+                let data = packet.split_to(packet.len());
+                Response::Unknown { typ, data }
+            }
+        };
+        debug_assert!(packet.is_empty());
+
+        if let Some((_id, tx)) = inner.pending_requests.remove(&id) {
+            let _ = tx.send(response);
+        }
     }
 }
 

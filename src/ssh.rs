@@ -67,7 +67,7 @@ pub(crate) fn connect(
     user: &str,
     host: &str,
     port: u16,
-) -> Result<(Child, Stream)> {
+) -> Result<Child> {
     let words = shell_words::split(command)?;
     let (prog, args) = words.split_first().unwrap();
     let mut cmd = Command::new(&prog);
@@ -82,12 +82,5 @@ pub(crate) fn connect(
         .stdout(Stdio::piped());
 
     tracing::debug!("spawn {:?}", cmd);
-    let mut child = cmd.spawn().context("failed to spawn ssh")?;
-
-    let stream = Stream {
-        reader: child.stdout.take().expect("missing stdout pipe"),
-        writer: child.stdin.take().expect("missing stdin pipe"),
-    };
-
-    Ok((child, stream))
+    Ok(cmd.spawn().context("failed to spawn ssh")?)
 }
