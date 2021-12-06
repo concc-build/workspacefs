@@ -1,5 +1,8 @@
 use anyhow::Result;
 use bytes::Bytes;
+use globset::Glob;
+use globset::GlobSet;
+use globset::GlobSetBuilder;
 use polyfuse::Operation;
 use polyfuse::Request;
 use polyfuse::op;
@@ -25,9 +28,9 @@ use crate::sftp;
 pub(crate) fn init(
     opt: &Opt,
     sftp: sftp::Session,
-) -> (Sender<Message>, Daemon) {
+) -> Result<(Sender<Message>, Daemon)> {
     let (sender, receiver) = mpsc::channel(100);
-    (sender, Daemon::new(opt, sftp, receiver))
+    Ok((sender, Daemon::new(opt, sftp, receiver)?))
 }
 
 pub(crate) enum Message {
@@ -53,6 +56,8 @@ pub(crate) struct Daemon {
     // cache
     attr_cache: HashMap<PathBuf, Arc<sftp::FileAttr>>,
     dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
+
+    negative_xglobset: GlobSet,
 }
 
 impl Daemon {
@@ -60,8 +65,12 @@ impl Daemon {
         opt: &Opt,
         sftp: sftp::Session,
         receiver: Receiver<Message>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let mut globset_builder = GlobSetBuilder::new();
+        for glob in opt.negative_xglobs.iter() {
+            globset_builder.add(Glob::new(glob)?);
+        }
+        Ok(Self {
             sftp,
             receiver,
             base_dir: PathBuf::from(opt.remote.path()),
@@ -70,7 +79,8 @@ impl Daemon {
             file_handles: Slab::new(),
             attr_cache: HashMap::new(),
             dirent_cache: HashMap::new(),
-        }
+            negative_xglobset: globset_builder.build()?,
+        })
     }
 
     pub(crate) async fn run(mut self) -> Result<()> {
@@ -141,31 +151,44 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let stat = match self.sftp.lstat(&full_path).await {
-            Ok(stat) => stat,
+        match self.sftp.lstat(&full_path).await {
+            Ok(stat) => {
+                tracing::debug!(?stat);
+
+                let stat = Arc::new(stat);
+                self.attr_cache.insert(full_path.clone(), stat.clone());
+
+                let path = full_path.strip_prefix(&self.base_dir).unwrap();
+                let inode = self.path_table.recognize(&path);
+                inode.refcount += 1;
+
+                let mut out = EntryOut::default();
+                fill_attr(out.attr(), &stat);
+                out.ttl_attr(Duration::from_secs(60));
+                out.ttl_entry(Duration::from_secs(60));
+                out.ino(inode.ino);
+                out.attr().ino(inode.ino);
+
+                req.reply(out)
+            }
             Err(err) => {
                 tracing::debug!(?err);
-                return req.reply_error(sftp_error_to_errno(&err));
+                let errno = sftp_error_to_errno(&err);
+                match errno {
+                    libc::ENOENT if !self.negative_xglobset.is_match(&full_path) => {
+                        tracing::debug!("cache negative lookup");
+                        // negative cache
+                        let mut out = EntryOut::default();
+                        out.ttl_attr(Duration::from_secs(3600));
+                        out.ttl_entry(Duration::from_secs(3600));
+                        req.reply(out)
+                    }
+                    err => {
+                        req.reply_error(err)
+                    }
+                }
             }
-        };
-
-        tracing::debug!(?stat);
-
-        let stat = Arc::new(stat);
-        self.attr_cache.insert(full_path.clone(), stat.clone());
-
-        let path = full_path.strip_prefix(&self.base_dir).unwrap();
-        let inode = self.path_table.recognize(&path);
-        inode.refcount += 1;
-
-        let mut out = EntryOut::default();
-        fill_attr(out.attr(), &stat);
-        out.ttl_attr(Duration::from_secs(60));
-        out.ttl_entry(Duration::from_secs(60));
-        out.ino(inode.ino);
-        out.attr().ino(inode.ino);
-
-        req.reply(out)
+        }
     }
 
     #[tracing::instrument(name = "forget", level = "debug", skip_all)]

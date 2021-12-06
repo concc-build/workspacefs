@@ -10,9 +10,13 @@ use url::Url;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// FUSE options.
+    /// FUSE mount options.
     #[structopt(short, number_of_values = 1)]
     options: Vec<String>,
+
+    /// Glob patterns of paths excluded from negative lookup caching.
+    #[structopt(short = "x", long, number_of_values = 1)]
+    negative_xglobs: Vec<String>,
 
     /// SSH command to be executed for establishing a connection.
     ///
@@ -35,7 +39,11 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(atty::is(atty::Stream::Stderr))
+        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .init();
 
     let opt = Opt::from_args();
 
@@ -59,7 +67,7 @@ async fn main() -> Result<()> {
     //     .context("failed to get target attribute")?;
     // ensure!(stat.is_dir(), "the target path is not directory");
 
-    let (sender, daemon) = daemon::init(&opt, sftp);
+    let (sender, daemon) = daemon::init(&opt, sftp)?;
     tokio::spawn(async move {
         let _ = daemon.run().await;
     });
