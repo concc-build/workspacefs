@@ -53,6 +53,11 @@ pub(crate) struct Daemon {
     dir_handles: Slab<DirHandle>,
     file_handles: Slab<FileState>,
 
+    // timeout values for caching
+    entry_timeout: Duration,
+    attr_timeout: Duration,
+    negative_timeout: Duration,
+
     // cache
     attr_cache: HashMap<PathBuf, Arc<sftp::FileAttr>>,
     dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
@@ -77,6 +82,9 @@ impl Daemon {
             path_table: PathTable::new(),
             dir_handles: Slab::new(),
             file_handles: Slab::new(),
+            entry_timeout: opt.entry_timeout,
+            attr_timeout: opt.attr_timeout,
+            negative_timeout: opt.negative_timeout,
             attr_cache: HashMap::new(),
             dirent_cache: HashMap::new(),
             negative_xglobset: globset_builder.build()?,
@@ -144,8 +152,8 @@ impl Daemon {
 
             let mut out = EntryOut::default();
             fill_attr(out.attr(), &stat);
-            out.ttl_attr(Duration::from_secs(60));
-            out.ttl_entry(Duration::from_secs(60));
+            out.ttl_attr(self.attr_timeout);
+            out.ttl_entry(self.entry_timeout);
             out.ino(inode.ino);
             out.attr().ino(inode.ino);
             return req.reply(out);
@@ -164,8 +172,8 @@ impl Daemon {
 
                 let mut out = EntryOut::default();
                 fill_attr(out.attr(), &stat);
-                out.ttl_attr(Duration::from_secs(60));
-                out.ttl_entry(Duration::from_secs(60));
+                out.ttl_attr(self.attr_timeout);
+                out.ttl_entry(self.entry_timeout);
                 out.ino(inode.ino);
                 out.attr().ino(inode.ino);
 
@@ -175,12 +183,11 @@ impl Daemon {
                 tracing::debug!(?err);
                 let errno = sftp_error_to_errno(&err);
                 match errno {
-                    libc::ENOENT if !self.negative_xglobset.is_match(&full_path) => {
+                    libc::ENOENT if self.can_cache_negative_lookup(&full_path) => {
                         tracing::debug!("cache negative lookup");
                         // negative cache
                         let mut out = EntryOut::default();
-                        out.ttl_attr(Duration::from_secs(3600));
-                        out.ttl_entry(Duration::from_secs(3600));
+                        out.ttl_entry(self.negative_timeout);
                         req.reply(out)
                     }
                     err => {
@@ -188,6 +195,19 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    fn can_cache_negative_lookup<P>(&self, path: P) -> bool
+    where
+        P: AsRef<Path>,
+    {
+        if self.negative_timeout.is_zero() {
+            false
+        } else if self.negative_xglobset.is_match(path) {
+            false
+        } else {
+            true
         }
     }
 
@@ -359,8 +379,8 @@ impl Daemon {
 
         let mut out = EntryOut::default();
         fill_attr(out.attr(), &stat);
-        out.ttl_attr(Duration::from_secs(60));
-        out.ttl_entry(Duration::from_secs(60));
+        out.ttl_attr(self.attr_timeout);
+        out.ttl_entry(self.entry_timeout);
         out.ino(inode.ino);
         out.attr().ino(inode.ino);
         req.reply(out)
@@ -687,8 +707,8 @@ impl Daemon {
 
         let mut entry_out = EntryOut::default();
         fill_attr(entry_out.attr(), &stat);
-        entry_out.ttl_attr(Duration::from_secs(60));
-        entry_out.ttl_entry(Duration::from_secs(60));
+        entry_out.ttl_attr(self.entry_timeout);
+        entry_out.ttl_entry(self.attr_timeout);
         entry_out.ino(inode.ino);
         entry_out.attr().ino(inode.ino);
 

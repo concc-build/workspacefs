@@ -4,7 +4,9 @@ mod sftp;
 mod ssh;
 
 use anyhow::{ensure, Context as _, Result};
+use humantime::parse_duration;
 use std::path::PathBuf;
+use std::time::Duration;
 use structopt::StructOpt;
 use url::Url;
 
@@ -17,8 +19,51 @@ struct Opt {
     #[structopt(short, number_of_values = 1)]
     options: Vec<String>,
 
+    /// Cache timeout for directory entries.
+    ///
+    /// A value is represented with a concatenation of time spans.  Where each
+    /// time span is an integer number and a suffix.  Supported suffixes:
+    ///
+    ///   * nsec, ns -- nanoseconds
+    ///   * usec, us -- microseconds
+    ///   * msec, ms -- milliseconds
+    ///   * seconds, second, sec, s
+    ///   * minutes, minute, min, m
+    ///   * hours, hour, hr, h
+    ///   * days, day, d
+    ///   * weeks, week, w
+    ///   * months, month, M -- defined as 30.44 days
+    ///   * years, year, y -- defined as 365.25 days
+    ///
+    /// "0<suffix>" means that caching is disabled.
+    #[structopt(
+        short = "E",
+        long,
+        default_value = "0s",
+        parse(try_from_str = parse_duration),
+        verbatim_doc_comment)]
+    entry_timeout: Duration,
+
+    /// Cache timeout for file attributes.
+    #[structopt(
+        short = "A",
+        long,
+        default_value = "0s",
+        parse(try_from_str = parse_duration),
+        verbatim_doc_comment)]
+    attr_timeout: Duration,
+
+    /// Cache timeout for negative lookups.
+    #[structopt(
+        short = "N",
+        long,
+        default_value = "0s",
+        parse(try_from_str = parse_duration),
+        verbatim_doc_comment)]
+    negative_timeout: Duration,
+
     /// Glob patterns of paths excluded from negative lookup caching.
-    #[structopt(short = "x", long, number_of_values = 1)]
+    #[structopt(short = "X", long, number_of_values = 1)]
     negative_xglobs: Vec<String>,
 
     /// SSH command to be executed for establishing a connection.

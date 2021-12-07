@@ -14,6 +14,7 @@ bytes = "1.1.0"
 dashmap = "4.0.2"
 futures = "0.3.17"
 globset = "0.4.8"
+humantime = "2.1.0"
 jemallocator = "0.3.2"
 libc = "0.2.108"
 polyfuse = { git = "https://github.com/masnagam/polyfuse.git" }
