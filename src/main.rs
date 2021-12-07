@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use url::Url;
 
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// FUSE mount options.
