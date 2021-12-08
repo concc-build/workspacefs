@@ -7,14 +7,15 @@ use polyfuse::Operation;
 use polyfuse::Request;
 use polyfuse::op;
 use polyfuse::reply::*;
-use slab::Slab;
-use tracing::Instrument;
+use static_assertions;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -22,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tracing;
+use tracing::Instrument;
 use crate::Opt;
 use crate::sftp;
 
@@ -50,8 +52,6 @@ pub(crate) struct Daemon {
     receiver: Receiver<Message>,
     base_dir: PathBuf,
     path_table: PathTable,
-    dir_handles: Slab<DirHandle>,
-    file_handles: Slab<FileState>,
 
     // timeout values for caching
     entry_timeout: Duration,
@@ -80,8 +80,6 @@ impl Daemon {
             receiver,
             base_dir: PathBuf::from(opt.remote.path()),
             path_table: PathTable::new(),
-            dir_handles: Slab::new(),
-            file_handles: Slab::new(),
             entry_timeout: opt.entry_timeout,
             attr_timeout: opt.attr_timeout,
             negative_timeout: opt.negative_timeout,
@@ -267,10 +265,10 @@ impl Daemon {
     #[tracing::instrument(name = "setattr", level = "debug", skip_all, fields(ino = op.ino()))]
     async fn do_setattr(&mut self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
         const NO_UID: u32 = unsafe {
-            std::mem::transmute::<i32, u32>(-1)
+            mem::transmute::<i32, u32>(-1)
         };
         const NO_GID: u32 = unsafe {
-            std::mem::transmute::<i32, u32>(-1)
+            mem::transmute::<i32, u32>(-1)
         };
 
         let path = match self.path_table.get(op.ino()) {
@@ -467,9 +465,10 @@ impl Daemon {
 
         if let Some(entries) = self.dirent_cache.get(&full_dirname) {
             tracing::debug!("hit cache");
-            let fh = self.dir_handles.insert(DirHandle {
+            let handle = Box::new(DirHandle {
                 entries: entries.clone()
-            }) as u64;
+            });
+            let fh = DirHandle::into_fh(handle);
             let mut out = OpenOut::default();
             out.fh(fh);
             out.direct_io(true);
@@ -540,7 +539,8 @@ impl Daemon {
         let entries = Arc::new(dst);
         self.dirent_cache.insert(full_dirname.clone(), entries.clone());
 
-        let fh = self.dir_handles.insert(DirHandle { entries }) as u64;
+        let handle = Box::new(DirHandle { entries });
+        let fh = DirHandle::into_fh(handle);
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -559,20 +559,20 @@ impl Daemon {
             return req.reply_error(libc::ENOSYS);
         }
 
-        let handle = match self.dir_handles.get_mut(op.fh() as usize) {
-            Some(handle) => handle,
+        let handle_ref = match HandleRef::<DirHandle>::from_fh(op.fh()) {
+            Some(handle_ref) => handle_ref,
             None => return req.reply_error(libc::EINVAL),
         };
 
         let offset = op.offset() as usize;
-        if offset >= handle.entries.len() {
+        if offset >= handle_ref.entries.len() {
             tracing::debug!("no entry to read");
             return req.reply(());
         }
 
         let mut nread = 0;
         let mut out = ReaddirOut::new(op.size() as usize);
-        for (i, entry) in handle.entries.iter().enumerate().skip(offset) {
+        for (i, entry) in handle_ref.entries.iter().enumerate().skip(offset) {
             if out.entry(&entry.name, entry.ino, entry.typ, (i + 1) as u64) {
                 tracing::debug!("buffer fulled");
                 break;
@@ -588,7 +588,8 @@ impl Daemon {
     fn do_releasedir(&mut self, req: &Request, op: op::Releasedir<'_>) -> io::Result<()> {
         tracing::debug!(ino = op.ino());
 
-        drop(self.dir_handles.remove(op.fh() as usize));
+        let _ = DirHandle::from_fh(op.fh());
+
         req.reply(())
     }
 
@@ -611,12 +612,11 @@ impl Daemon {
             _ => sftp::OpenFlag::empty(),
         };
 
-        let state = FileState {
+        let handle = Box::new(FileHandle {
             open_flags,
             handle: None,
-        };
-
-        let fh = self.file_handles.insert(state) as u64;
+        });
+        let fh = FileHandle::into_fh(handle);
         tracing::debug!(?fh);
 
         let mut out = OpenOut::default();
@@ -697,12 +697,11 @@ impl Daemon {
         let inode = self.path_table.recognize(&path);
         inode.refcount += 1;
 
-        let state = FileState {
+        let handle = Box::new(FileHandle {
             open_flags,
             handle: Some(handle),
-        };
-
-        let fh = self.file_handles.insert(state) as u64;
+        });
+        let fh = FileHandle::into_fh(handle);
         tracing::debug!(?fh);
 
         let mut entry_out = EntryOut::default();
@@ -806,11 +805,13 @@ impl Daemon {
 
     #[tracing::instrument(name = "release", level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
     async fn do_release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
-        let state = self.file_handles.remove(op.fh() as usize);
-        tracing::debug!("released");
+        let handle = match FileHandle::from_fh(op.fh()) {
+            Some(handle) => handle,
+            None => return req.reply_error(libc::EINVAL),
+        };
 
-        if let Some(handle) = state.handle {
-            match self.sftp.close(&handle).await {
+        if let Some(ref sftp_handle) = handle.handle {
+            match self.sftp.close(sftp_handle).await {
                 Ok(()) => tracing::debug!("closed sucessfully"),
                 Err(err) => {
                     tracing::error!(?err, "sftp.close failed");
@@ -819,6 +820,7 @@ impl Daemon {
             }
         }
 
+        tracing::debug!("released");
         req.reply(())
     }
 
@@ -838,41 +840,103 @@ impl Daemon {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        let state = match self.file_handles.get(fh as usize) {
-            Some(state) => state.clone(),
+        let (open_flags, sftp_handle) = match HandleRef::<FileHandle>::from_fh(fh) {
+            Some(handle_ref) => (handle_ref.open_flags, handle_ref.handle.clone()),
             None => return Err(libc::EINVAL),
         };
 
-        if let Some(handle) = state.handle {
+        if let Some(sftp_handle) = sftp_handle {
             tracing::debug!("already opened");
-            return Ok(handle);
+            return Ok(sftp_handle);
         }
 
-        let handle = match self
+        let sftp_handle = match self
             .sftp
-            .open(&full_path, state.open_flags, &Default::default())
+            .open(&full_path, open_flags, &Default::default())
             .await
         {
             Ok(file) => file,
             Err(err) => return Err(sftp_error_to_errno(&err)),
         };
 
-        self.file_handles
-            .get_mut(fh as usize)
-            .unwrap().handle = Some(handle.clone());
+        HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(sftp_handle.clone());
 
-        Ok(handle)
+        Ok(sftp_handle)
     }
-}
-
-#[derive(Clone)]
-struct FileState {
-    open_flags: sftp::OpenFlag,
-    handle: Option<sftp::FileHandle>,
 }
 
 struct DirHandle {
     entries: Arc<Vec<DirEntry>>,
+}
+
+impl DirHandle {
+    fn into_fh(b: Box<Self>) -> u64 {
+        static_assertions::const_assert!(
+            mem::size_of::<u64>() >= mem::size_of::<*mut DirHandle>());
+        let raw = Box::into_raw(b);
+        raw as u64
+    }
+
+    fn from_fh(fh: u64) -> Option<Box<Self>> {
+        unsafe {
+            match fh {
+                0 => None,
+                _ => Some(Box::from_raw(fh as *mut DirHandle)),
+            }
+        }
+    }
+}
+
+struct FileHandle {
+    open_flags: sftp::OpenFlag,
+    handle: Option<sftp::FileHandle>,
+}
+
+impl FileHandle {
+    fn into_fh(b: Box<Self>) -> u64 {
+        static_assertions::const_assert!(
+            mem::size_of::<u64>() >= mem::size_of::<*mut FileHandle>());
+        let raw = Box::into_raw(b);
+        raw as u64
+    }
+
+    fn from_fh(fh: u64) -> Option<Box<Self>> {
+        unsafe {
+            match fh {
+                0 => None,
+                _ => Some(Box::from_raw(fh as *mut FileHandle)),
+            }
+        }
+    }
+}
+
+struct HandleRef<T> {
+    inner: NonNull<T>,
+}
+
+impl<T> HandleRef<T> {
+    fn from_fh(fh: u64) -> Option<Self> {
+        NonNull::new(fh as *mut T)
+            .map(|inner| Self { inner })
+    }
+}
+
+impl<T> std::ops::Deref for HandleRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            self.inner.as_ref()
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for HandleRef<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            self.inner.as_mut()
+        }
+    }
 }
 
 #[derive(Debug)]
