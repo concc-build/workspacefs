@@ -512,10 +512,13 @@ impl Daemon {
                 continue;
             }
 
-            let ino = self
-                .path_table
-                .lookup_ino(&dirname.join(&entry.filename))
-                .unwrap_or(NO_INO);
+            let ino = if cfg!(target_os = "linux") {
+                NO_INO
+            } else {
+                self.path_table
+                    .lookup_ino(&dirname.join(&entry.filename))
+                    .unwrap_or(NO_INO)
+            };
 
             let typ = entry
                 .attrs
