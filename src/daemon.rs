@@ -1052,7 +1052,8 @@ impl PathTable {
             };
             if refcount == 0 {
                 tracing::debug!(ino, "dropped");
-                drop(entry.remove());
+                let inode = entry.remove();
+                self.path_to_ino.remove(&inode.path);
             }
         }
     }
