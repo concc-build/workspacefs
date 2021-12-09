@@ -146,13 +146,13 @@ impl Daemon {
         if let Some(stat) = self.attr_cache.get(&full_path) {
             tracing::debug!("hit cache");
             let inode = self.path_table.recognize(&path);
-            inode.refcount += 1;
 
             let mut out = EntryOut::default();
             fill_attr(out.attr(), &stat);
             out.ttl_attr(self.attr_timeout);
             out.ttl_entry(self.entry_timeout);
             out.ino(inode.ino);
+            out.generation(inode.generation);
             out.attr().ino(inode.ino);
             return req.reply(out);
         }
@@ -166,13 +166,13 @@ impl Daemon {
 
                 let path = full_path.strip_prefix(&self.base_dir).unwrap();
                 let inode = self.path_table.recognize(&path);
-                inode.refcount += 1;
 
                 let mut out = EntryOut::default();
                 fill_attr(out.attr(), &stat);
                 out.ttl_attr(self.attr_timeout);
                 out.ttl_entry(self.entry_timeout);
                 out.ino(inode.ino);
+                out.generation(inode.generation);
                 out.attr().ino(inode.ino);
 
                 req.reply(out)
@@ -373,13 +373,13 @@ impl Daemon {
         
         let path = linkpath.strip_prefix(&self.base_dir).unwrap();
         let inode = self.path_table.recognize(&path);
-        inode.refcount += 1;
 
         let mut out = EntryOut::default();
         fill_attr(out.attr(), &stat);
         out.ttl_attr(self.attr_timeout);
         out.ttl_entry(self.entry_timeout);
         out.ino(inode.ino);
+        out.generation(inode.generation);
         out.attr().ino(inode.ino);
         req.reply(out)
     }
@@ -513,8 +513,8 @@ impl Daemon {
 
             let ino = self
                 .path_table
-                .recognize(&dirname.join(&entry.filename))
-                .ino;
+                .lookup_ino(&dirname.join(&entry.filename))
+                .unwrap_or(NO_INO);
 
             let typ = entry
                 .attrs
@@ -695,7 +695,6 @@ impl Daemon {
         let _ = self.dirent_cache.remove(&full_dirpath);
 
         let inode = self.path_table.recognize(&path);
-        inode.refcount += 1;
 
         let handle = Box::new(FileHandle {
             open_flags,
@@ -709,6 +708,7 @@ impl Daemon {
         entry_out.ttl_attr(self.entry_timeout);
         entry_out.ttl_entry(self.attr_timeout);
         entry_out.ino(inode.ino);
+        entry_out.generation(inode.generation);
         entry_out.attr().ino(inode.ino);
 
         let mut open_out = OpenOut::default();
@@ -985,14 +985,18 @@ fn sftp_error_to_errno(err: &sftp::Error) -> i32 {
 struct PathTable {
     inodes: HashMap<u64, INode>,
     path_to_ino: HashMap<PathBuf, u64>,
-    next_ino: u64,
+    count: u64,
+    generation: u64,
 }
 
 struct INode {
-    ino: u64,
-    path: PathBuf,
     refcount: u64,
+    ino: u64,
+    generation: u64,
+    path: PathBuf,
 }
+
+const NO_INO: u64 = 0xFFFFFFFF;
 
 impl PathTable {
     fn new() -> Self {
@@ -1000,9 +1004,10 @@ impl PathTable {
         inodes.insert(
             1,
             INode {
-                ino: 1,
-                path: PathBuf::new(),
                 refcount: u64::MAX / 2,
+                ino: 1,
+                generation: 0,
+                path: PathBuf::new(),
             },
         );
 
@@ -1012,12 +1017,40 @@ impl PathTable {
         Self {
             inodes,
             path_to_ino,
-            next_ino: 2,
+            count: 1,
+            generation: 0,
         }
+    }
+
+    fn make_next_ino(&mut self) -> (u64, u64) {
+        let mut count = self.count;
+        let mut generation = self.generation;
+        loop {
+            count += 1;
+            if count == NO_INO {
+                let (new_generation, overflow) = generation.overflowing_add(1);
+                assert!(!overflow);
+                generation = new_generation;
+                count = 1;
+                continue;
+            }
+            debug_assert!(count > 1);
+            if self.inodes.contains_key(&count) {
+                continue;
+            }
+            break;
+        }
+        self.count = count;
+        self.generation = generation;
+        (count, generation)
     }
 
     fn get(&self, ino: u64) -> Option<&Path> {
         self.inodes.get(&ino).map(|inode| &*inode.path)
+    }
+
+    fn lookup_ino(&self, path: &Path) -> Option<u64> {
+        self.path_to_ino.get(path).cloned()
     }
 
     fn recognize(&mut self, path: &Path) -> &mut INode {
@@ -1025,18 +1058,14 @@ impl PathTable {
             Some(&ino) => self.inodes.get_mut(&ino).expect("inode is missing"),
 
             None => {
-                let ino = self.next_ino;
-                debug_assert!(!self.inodes.contains_key(&ino));
-
+                let (ino, generation) = self.make_next_ino();
                 let inode = self.inodes.entry(ino).or_insert_with(|| INode {
+                    refcount: 1,
                     ino,
+                    generation,
                     path: path.to_owned(),
-                    refcount: 0,
                 });
-
                 self.path_to_ino.insert(path.to_owned(), ino);
-                self.next_ino = self.next_ino.wrapping_add(1);
-
                 inode
             }
         }
