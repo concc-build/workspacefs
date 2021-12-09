@@ -119,6 +119,7 @@ impl Daemon {
             Operation::Read(op) => self.do_read(&req, op).await?,
             Operation::Write(op, data) => self.do_write(&req, op, data).await?,
             Operation::Release(op) => self.do_release(&req, op).await?,
+            Operation::Interrupt(op) => self.do_interrupt(&req,op)?,
 
             op @ _ => {
                 tracing::trace!(?op);
@@ -822,6 +823,18 @@ impl Daemon {
 
         tracing::debug!("released");
         req.reply(())
+    }
+
+    #[tracing::instrument(name = "interrupt", level = "debug", skip_all, fields(id = op.unique()))]
+    fn do_interrupt(
+        &mut self,
+        _req: &Request,
+        op: op::Interrupt<'_>
+    ) -> io::Result<()> {
+        // Currrently, a request is processed on a single thread.
+        // So, stopping the processing of the request is not needed.
+        tracing::debug!("interrupted");
+        Ok(())
     }
 
     #[tracing::instrument(name = "ensure_open", level = "debug", skip_all)]
