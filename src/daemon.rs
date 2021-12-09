@@ -118,7 +118,7 @@ impl Daemon {
             Operation::Create(op) => self.do_create(&req, op).await?,
             Operation::Read(op) => self.do_read(&req, op).await?,
             Operation::Write(op, data) => self.do_write(&req, op, data).await?,
-            Operation::Release(op) => self.do_release(&req, op).await?,
+            Operation::Release(op) => self.do_release(&req, op)?,
             Operation::Interrupt(op) => self.do_interrupt(&req,op)?,
 
             op @ _ => {
@@ -477,8 +477,8 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let dir = match self.sftp.opendir(&full_dirname).await {
-            Ok(dir) => dir,
+        let handle = match self.sftp.opendir(&full_dirname).await {
+            Ok(handle) => handle,
             Err(err) => {
                 tracing::error!(?err);
                 return req.reply_error(sftp_error_to_errno(&err))
@@ -487,7 +487,7 @@ impl Daemon {
 
         let mut entries = vec![];
         loop {
-            match self.sftp.readdir(&dir).await {
+            match self.sftp.readdir(&handle).await {
                 Ok(mut new_entries) => {
                     entries.append(&mut new_entries);
                 }
@@ -501,10 +501,7 @@ impl Daemon {
             }
         }
 
-        if let Err(err) = self.sftp.close(&dir).await {
-            tracing::error!(?err);
-            return req.reply_error(sftp_error_to_errno(&err))
-        }
+        self.invoke_close(handle);
 
         let mut dst = vec![];
         for entry in entries {
@@ -684,8 +681,8 @@ impl Daemon {
         let stat = match self.sftp.lstat(&full_path).await {
             Ok(stat) => stat,
             Err(err) => {
+                self.invoke_close(handle);
                 tracing::error!("reply_err({:?})", err);
-                let _ = self.sftp.close(&handle).await;
                 return req.reply_error(sftp_error_to_errno(&err));
             }
         };
@@ -808,20 +805,14 @@ impl Daemon {
     }
 
     #[tracing::instrument(name = "release", level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    async fn do_release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
-        let handle = match FileHandle::from_fh(op.fh()) {
+    fn do_release(&self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
+        let mut handle = match FileHandle::from_fh(op.fh()) {
             Some(handle) => handle,
             None => return req.reply_error(libc::EINVAL),
         };
 
-        if let Some(ref sftp_handle) = handle.handle {
-            match self.sftp.close(sftp_handle).await {
-                Ok(()) => tracing::debug!("closed sucessfully"),
-                Err(err) => {
-                    tracing::error!(?err, "sftp.close failed");
-                    return req.reply_error(sftp_error_to_errno(&err));
-                }
-            }
+        if let Some(handle) = handle.handle.take() {
+            self.invoke_close(handle);
         }
 
         tracing::debug!("released");
@@ -878,6 +869,16 @@ impl Daemon {
         HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(sftp_handle.clone());
 
         Ok(sftp_handle)
+    }
+
+    fn invoke_close(&self, handle: sftp::FileHandle) {
+        let sftp = self.sftp.clone();
+        tokio::spawn(async move {
+            match sftp.close(&handle).await {
+                Ok(_) => tracing::debug!("closed successfully"),
+                Err(err) => tracing::error!(?err, "sftp.close failed"),
+            }
+        }.instrument(tracing::debug_span!("task")));
     }
 }
 
