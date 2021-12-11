@@ -662,22 +662,41 @@ impl Session {
         }
     }
 
+    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
+        self.inner.upgrade().unwrap().has_extension(extension)
+    }
+
     pub async fn rename<P>(&self, oldpath: P, newpath: P,) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
+        // TODO: should be const
+        let posix_rename_extension: (OsString, OsString) =
+            (OsString::from("posix-rename@openssh.com"), OsString::from("1"));
+
+        let (type_, additioal_len) = if self.has_extension(&posix_rename_extension) {
+            (SSH_FXP_EXTENDED, 4 + posix_rename_extension.0.as_bytes().len())
+        } else {
+            (SSH_FXP_RENAME, 0)
+        };
+
         let oldpath = oldpath.as_ref();
         let newpath = newpath.as_ref();
 
-        let payload_len = 8 + oldpath.as_bytes().len() + newpath.as_bytes().len();
+        let payload_len = 8 + oldpath.as_bytes().len() + newpath.as_bytes().len()
+            + additioal_len;
 
         let mut payload = BytesMut::with_capacity(payload_len);
+        if type_ == SSH_FXP_EXTENDED {
+            payload.put_u32(posix_rename_extension.0.as_bytes().len() as u32);
+            payload.put(posix_rename_extension.0.as_bytes());
+        }
         payload.put_u32(oldpath.as_bytes().len() as u32);
         payload.put(oldpath.as_bytes());
         payload.put_u32(newpath.as_bytes().len() as u32);
         payload.put(newpath.as_bytes());
 
-        match self.request(SSH_FXP_RENAME, vec![payload.freeze()]).await? {
+        match self.request(type_, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
@@ -840,6 +859,10 @@ impl Inner {
 
         rx.await.map_err(|_| Error::SessionClosed)
     }
+
+    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
+        self.extensions.iter().any(|ext| ext == extension)
+    }
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -997,6 +1020,9 @@ impl InitSession {
             let data = read_string(&mut packet)?;
             extensions.push((name, data));
         }
+
+        tracing::debug!(version);
+        tracing::debug!(?extensions);
 
         let (tx, rx) = mpsc::unbounded_channel::<Vec<Bytes>>();
 

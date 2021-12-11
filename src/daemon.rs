@@ -179,7 +179,7 @@ impl Daemon {
                 req.reply(out)
             }
             Err(err) => {
-                tracing::debug!(?err);
+                tracing::error!(?err);
                 let errno = sftp_error_to_errno(&err);
                 match errno {
                     libc::ENOENT if self.can_cache_negative_lookup(&full_path) => {
@@ -243,7 +243,7 @@ impl Daemon {
         let stat = match self.sftp.lstat(&full_path).await {
             Ok(stat) => stat,
             Err(err) => {
-                tracing::debug!(?err);
+                tracing::error!(?err);
                 return req.reply_error(sftp_error_to_errno(&err));
             }
         };
@@ -438,6 +438,19 @@ impl Daemon {
 
         match self.sftp.rename(&oldpath, &newpath).await {
             Ok(()) => {
+                self.path_table.rename(
+                    oldpath.strip_prefix(&self.base_dir).unwrap(),
+                    newpath.strip_prefix(&self.base_dir).unwrap());
+                self.attr_cache.remove(&oldpath);
+                self.attr_cache.remove(&newpath);
+                self.dirent_cache.remove(&oldpath);
+                self.dirent_cache.remove(&newpath);
+                let old_parent = self.base_dir.join(&parent);
+                let new_parent = self.base_dir.join(&new_parent);
+                self.attr_cache.remove(&old_parent);
+                self.attr_cache.remove(&new_parent);
+                self.dirent_cache.remove(&old_parent);
+                self.dirent_cache.remove(&new_parent);
                 tracing::debug!("done");
                 req.reply(())
             }
@@ -1102,5 +1115,17 @@ impl PathTable {
                 self.path_to_ino.remove(&inode.path);
             }
         }
+    }
+
+    #[tracing::instrument(name = "rename", level = "debug", skip_all)]
+    fn rename(&mut self, old: &Path, new: &Path) {
+        tracing::debug!(?old, ?new);
+        if let Some(ino) = self.path_to_ino.get(new) {
+            // TODO: keep inode while someone uses it
+            self.inodes.remove(ino);
+            self.path_to_ino.remove(new);
+        }
+        let ino = self.path_to_ino.remove(old).expect("ino is missing");
+        self.path_to_ino.insert(new.to_owned(), ino);
     }
 }
