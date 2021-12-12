@@ -20,6 +20,7 @@ use std::{
         Arc, Weak,
     },
 };
+use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::io::IoSlice;
@@ -128,7 +129,7 @@ impl RemoteError {
 }
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[non_exhaustive]
 pub struct FileAttr {
     pub size: Option<u64>,
@@ -221,6 +222,28 @@ impl FileAttr {
                 b.put(data.as_bytes());
             }
         }
+    }
+}
+
+impl fmt::Debug for FileAttr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "(")?;
+        if let Some(size) = self.size {
+            write!(f, " size={}", size)?;
+        }
+        if let Some((uid, gid)) = self.uid_gid {
+            write!(f, " uid={} gid={}", uid, gid)?;
+        }
+        if let Some(permissions) = self.permissions {
+            write!(f, " mode={:#o}", permissions)?;
+        }
+        if let Some((atime, mtime)) = self.ac_mod_time {
+            write!(f, " atime={} mtime={}", atime, mtime)?;
+        }
+        for ext in self.extended.iter() {
+            write!(f, " {:?}={:?}", ext.0, ext.1)?;
+        }
+        write!(f, " )")
     }
 }
 
