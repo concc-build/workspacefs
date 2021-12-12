@@ -103,9 +103,10 @@ async fn main() -> Result<()> {
     let sftp_user = opt.remote.username();
     let sftp_host = opt.remote.host_str().unwrap();
     let sftp_port = opt.remote.port().unwrap_or(22);
+    let sftp_path = opt.remote.path();
 
     let sftp = sftp::init(
-        &opt.ssh_command, sftp_user, sftp_host, sftp_port)
+        &opt.ssh_command, sftp_user, sftp_host, sftp_port, sftp_path)
         .await
         .context("failed to initialize SFTP session")?;
 

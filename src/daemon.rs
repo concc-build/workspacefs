@@ -50,7 +50,6 @@ impl fmt::Debug for Message {
 pub(crate) struct Daemon {
     sftp: sftp::Session,
     receiver: Receiver<Message>,
-    base_dir: PathBuf,
     path_table: PathTable,
 
     // timeout values for caching
@@ -78,7 +77,6 @@ impl Daemon {
         Ok(Self {
             sftp,
             receiver,
-            base_dir: PathBuf::from(opt.remote.path()),
             path_table: PathTable::new(),
             entry_timeout: opt.entry_timeout,
             attr_timeout: opt.attr_timeout,
@@ -140,11 +138,9 @@ impl Daemon {
                 return req.reply_error(libc::EINVAL);
             }
         };
+        tracing::debug!(?path);
 
-        let full_path = self.base_dir.join(&path);
-        tracing::debug!(?full_path);
-
-        if let Some(stat) = self.attr_cache.get(&full_path) {
+        if let Some(stat) = self.attr_cache.get(&path) {
             tracing::debug!("hit cache");
             let inode = self.path_table.recognize(&path);
 
@@ -158,14 +154,12 @@ impl Daemon {
             return req.reply(out);
         }
 
-        match self.sftp.lstat(&full_path).await {
+        match self.sftp.lstat(&path).await {
             Ok(stat) => {
-                tracing::debug!(?stat);
-
+                tracing::debug!(?path, attr = ?stat, "cache attr");
                 let stat = Arc::new(stat);
-                self.attr_cache.insert(full_path.clone(), stat.clone());
+                self.attr_cache.insert(path.clone(), stat.clone());
 
-                let path = full_path.strip_prefix(&self.base_dir).unwrap();
                 let inode = self.path_table.recognize(&path);
 
                 let mut out = EntryOut::default();
@@ -179,10 +173,9 @@ impl Daemon {
                 req.reply(out)
             }
             Err(err) => {
-                tracing::error!(?err);
                 let errno = sftp_error_to_errno(&err);
                 match errno {
-                    libc::ENOENT if self.can_cache_negative_lookup(&full_path) => {
+                    libc::ENOENT if self.can_cache_negative_lookup(&path) => {
                         tracing::debug!("cache negative lookup");
                         // negative cache
                         let mut out = EntryOut::default();
@@ -190,6 +183,7 @@ impl Daemon {
                         req.reply(out)
                     }
                     err => {
+                        tracing::warn!(?err);
                         req.reply_error(err)
                     }
                 }
@@ -227,11 +221,9 @@ impl Daemon {
                 return req.reply_error(libc::EINVAL);
             }
         };
+        tracing::debug!(?path);
 
-        let full_path = self.base_dir.join(path).clone();
-        tracing::debug!(?full_path);
-
-        if let Some(stat) = self.attr_cache.get(&full_path) {
+        if let Some(stat) = self.attr_cache.get(path) {
             tracing::debug!("hit cache");
             let mut out = AttrOut::default();
             fill_attr(out.attr(), &stat);
@@ -240,7 +232,7 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let stat = match self.sftp.lstat(&full_path).await {
+        let stat = match self.sftp.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => {
                 tracing::error!(?err);
@@ -248,17 +240,13 @@ impl Daemon {
             }
         };
 
-        tracing::debug!(?stat);
-
+        tracing::debug!(?path, attr = ?stat, "cache attr");
         let stat = Arc::new(stat);
-        self.attr_cache.insert(full_path.clone(), stat.clone());
-
-        let path = full_path.strip_prefix(&self.base_dir).unwrap();
-        let ino = self.path_table.recognize(&path);
+        self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
         fill_attr(out.attr(), &stat);
-        out.attr().ino(ino.ino);
+        out.attr().ino(op.ino());
         out.ttl(Duration::from_secs(60));
         req.reply(out)
     }
@@ -276,9 +264,7 @@ impl Daemon {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
-
-        let full_path = self.base_dir.join(path).clone();
-        tracing::debug!(?full_path);
+        tracing::debug!(?path);
 
         let mut stat = sftp::FileAttr::default();
         stat.size = op.size();
@@ -307,16 +293,19 @@ impl Daemon {
                 }
             })
             .flatten();
-        if let Err(err) = self.sftp.setstat(&full_path, &stat).await {
+        if let Err(err) = self.sftp.setstat(&path, &stat).await {
             tracing::error!(?err);
             return req.reply_error(sftp_error_to_errno(&err));
         }
 
-        let stat = match self.sftp.lstat(&full_path).await {
+        let stat = match self.sftp.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
-        tracing::debug!(?stat);
+
+        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let stat = Arc::new(stat);
+        self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
         fill_attr(out.attr(), &stat);
@@ -333,11 +322,9 @@ impl Daemon {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
+        tracing::debug!(?path);
 
-        let full_path = self.base_dir.join(path);
-        tracing::debug!(?full_path);
-
-        let link = match self.sftp.readlink(&full_path).await {
+        let link = match self.sftp.readlink(&path).await {
             Ok(link) => link,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
@@ -347,16 +334,16 @@ impl Daemon {
 
     #[tracing::instrument(name = "symlink", level = "debug", skip_all)]
     async fn do_symlink(&mut self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.parent()) {
+        let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let linkpath = self.base_dir.join(&path).join(op.name());
-        let targetpath = self.base_dir.join(op.link());
-        tracing::debug!(?linkpath, ?targetpath);
+        let link_path = parent_path.join(op.name());
+        let target_path = op.link();
+        tracing::debug!(?link_path, ?target_path);
 
-        match self.sftp.symlink(&linkpath, &targetpath).await {
+        match self.sftp.symlink(&link_path, &target_path).await {
             Ok(()) => {
                 tracing::debug!("created");
             }
@@ -366,14 +353,20 @@ impl Daemon {
             }
         }
 
-        let stat = match self.sftp.lstat(&linkpath).await {
+        let stat = match self.sftp.lstat(&link_path).await {
             Ok(stat) => stat,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
-        tracing::debug!(?stat);
-        
-        let path = linkpath.strip_prefix(&self.base_dir).unwrap();
-        let inode = self.path_table.recognize(&path);
+
+        tracing::debug!(?link_path, attr = ?stat, "cache attr");
+        let stat = Arc::new(stat);
+        self.attr_cache.insert(link_path.clone(), stat.clone());
+
+        tracing::debug!(?parent_path, "invalidate cache");
+        self.attr_cache.remove(parent_path);
+        self.dirent_cache.remove(parent_path);
+
+        let inode = self.path_table.recognize(&link_path);
 
         let mut out = EntryOut::default();
         fill_attr(out.attr(), &stat);
@@ -389,68 +382,79 @@ impl Daemon {
     async fn do_unlink(&mut self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
         tracing::debug!(parent = op.parent(), name = ?op.name());
 
-        let dirpath = match self.path_table.get(op.parent()) {
+        let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let full_path = self.base_dir.join(dirpath).join(op.name());
-        tracing::debug!(?full_path);
+        let path = parent_path.join(op.name());
+        tracing::debug!(?path);
 
-        match self.sftp.remove(&full_path).await {
+        match self.sftp.remove(&path).await {
             Ok(_) => (),
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         }
 
-        let _ = self.attr_cache.remove(&full_path);
+        tracing::debug!(?path, "invalidate cache");
+        self.attr_cache.remove(&path);
+        self.dirent_cache.remove(&path);
 
-        let full_dirpath = self.base_dir.join(dirpath);
-        let _ = self.attr_cache.remove(&full_dirpath);
-        let _ = self.dirent_cache.remove(&full_dirpath);
+        tracing::debug!(?parent_path, "invalidate cache");
+        self.attr_cache.remove(parent_path);
+        self.dirent_cache.remove(parent_path);
 
         req.reply(())
     }
 
     #[tracing::instrument(name = "rename", level = "debug", skip_all)]
     async fn do_rename(&mut self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
-        let parent = match self.path_table.get(op.parent()) {
+        let old_parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let new_parent = match self.path_table.get(op.newparent()) {
+        let new_parent_path = match self.path_table.get(op.newparent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let oldpath = self.base_dir.join(&parent).join(op.name());
-        let newpath = self.base_dir.join(&new_parent).join(op.newname());
-        tracing::debug!(?oldpath, ?newpath);
+        let old_path = old_parent_path.join(op.name());
+        let new_path = new_parent_path.join(op.newname());
+        tracing::debug!(?old_path, ?new_path);
+
+        if old_path == new_path {
+            tracing::debug!("same path");
+            return req.reply(());
+        }
 
         if op.flags() & libc::RENAME_NOREPLACE == 0 {
-            tracing::debug!(?newpath, "Trying to remove it first...");
-            if let Err(_) = self.sftp.remove(&newpath).await {
+            tracing::debug!(?new_path, "Trying to remove it first...");
+            if let Err(_) = self.sftp.remove(&new_path).await {
                 tracing::debug!("sftp.remove failed");
                 return req.reply_error(libc::EEXIST)
 
             }
         }
 
-        match self.sftp.rename(&oldpath, &newpath).await {
+        match self.sftp.rename(&old_path, &new_path).await {
             Ok(()) => {
-                self.path_table.rename(
-                    oldpath.strip_prefix(&self.base_dir).unwrap(),
-                    newpath.strip_prefix(&self.base_dir).unwrap());
-                self.attr_cache.remove(&oldpath);
-                self.attr_cache.remove(&newpath);
-                self.dirent_cache.remove(&oldpath);
-                self.dirent_cache.remove(&newpath);
-                let old_parent = self.base_dir.join(&parent);
-                let new_parent = self.base_dir.join(&new_parent);
-                self.attr_cache.remove(&old_parent);
-                self.attr_cache.remove(&new_parent);
-                self.dirent_cache.remove(&old_parent);
-                self.dirent_cache.remove(&new_parent);
+                self.path_table.rename(&old_path, &new_path);
+                tracing::debug!(?old_path, "invalidate cache");
+                self.attr_cache.remove(&old_path);
+                self.dirent_cache.remove(&old_path);
+                if old_path != new_path {
+                    tracing::debug!(?new_path, "invalidate cache");
+                    self.attr_cache.remove(&new_path);
+                    self.dirent_cache.remove(&new_path);
+                }
+                tracing::debug!(?old_parent_path, "invalidate cache");
+                self.attr_cache.remove(&old_parent_path);
+                self.dirent_cache.remove(&old_parent_path);
+                if old_parent_path != new_parent_path {
+                    tracing::debug!(?new_parent_path, "invalidate cache");
+                    self.attr_cache.remove(&new_parent_path);
+                    self.dirent_cache.remove(&new_parent_path);
+                }
                 tracing::debug!("done");
                 req.reply(())
             }
@@ -469,15 +473,13 @@ impl Daemon {
     ) -> io::Result<()> {
         tracing::debug!(ino = op.ino());
 
-        let dirname = match self.path_table.get(op.ino()) {
+        let path = match self.path_table.get(op.ino()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
+        tracing::debug!(?path);
 
-        let full_dirname = self.base_dir.join(&dirname);
-        tracing::debug!(?full_dirname);
-
-        if let Some(entries) = self.dirent_cache.get(&full_dirname) {
+        if let Some(entries) = self.dirent_cache.get(&path) {
             tracing::debug!("hit cache");
             let handle = Box::new(DirHandle {
                 entries: entries.clone()
@@ -490,7 +492,7 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let handle = match self.sftp.opendir(&full_dirname).await {
+        let handle = match self.sftp.opendir(&path).await {
             Ok(handle) => handle,
             Err(err) => {
                 tracing::error!(?err);
@@ -517,17 +519,17 @@ impl Daemon {
         self.invoke_close(handle);
 
         let mut dst = vec![];
-        for entry in entries {
+        for entry in entries.into_iter() {
             if entry.filename == "." || entry.filename == ".." {
                 continue;
             }
 
+            let entry_path = path.join(&entry.filename);
+
             let ino = if cfg!(target_os = "linux") {
                 NO_INO
             } else {
-                self.path_table
-                    .lookup_ino(&dirname.join(&entry.filename))
-                    .unwrap_or(NO_INO)
+                self.path_table.lookup_ino(&entry_path).unwrap_or(NO_INO)
             };
 
             let typ = entry
@@ -537,10 +539,9 @@ impl Daemon {
                     (perm & libc::S_IFMT) >> 12
                 });
 
+            tracing::debug!(?entry_path, attr = ?entry.attrs, "cache attr");
             let stat = Arc::new(entry.attrs);
-            let path = full_dirname.join(&entry.filename);
-            tracing::debug!(?path, ?stat, "attr_cache.insert");
-            self.attr_cache.insert(path, stat);
+            self.attr_cache.insert(entry_path, stat);
 
             dst.push(DirEntry {
                 name: entry.filename,
@@ -551,7 +552,7 @@ impl Daemon {
         tracing::debug!(num = dst.len());
 
         let entries = Arc::new(dst);
-        self.dirent_cache.insert(full_dirname.clone(), entries.clone());
+        self.dirent_cache.insert(path, entries.clone());
 
         let handle = Box::new(DirHandle { entries });
         let fh = DirHandle::into_fh(handle);
@@ -570,6 +571,7 @@ impl Daemon {
                         size = op.size());
 
         if op.mode() == op::ReaddirMode::Plus {
+            tracing::error!("not supported");
             return req.reply_error(libc::ENOSYS);
         }
 
@@ -615,9 +617,7 @@ impl Daemon {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
-
-        let full_path = self.base_dir.join(path);
-        tracing::debug!(?full_path);
+        tracing::debug!(?path);
 
         let open_flags = match op.flags() as i32 & libc::O_ACCMODE {
             libc::O_RDONLY => sftp::OpenFlag::READ,
@@ -626,6 +626,7 @@ impl Daemon {
             _ => sftp::OpenFlag::empty(),
         };
 
+        // TODO: Keep inode until the handle is released.
         let handle = Box::new(FileHandle {
             open_flags,
             handle: None,
@@ -647,15 +648,13 @@ impl Daemon {
         op: op::Create<'_>
     ) -> io::Result<()> {
         tracing::debug!(ino = ?op.parent());
-        let dirpath = match self.path_table.get(op.parent()) {
-            Some(path) => path,
+        let parent_path = match self.path_table.get(op.parent()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let path = dirpath.join(op.name());
-
-        let full_path = self.base_dir.join(&path);
-        tracing::debug!(?full_path);
+        let path = parent_path.join(op.name());
+        tracing::debug!(?path);
 
         let mut open_flags = match op.open_flags() as i32 & libc::O_ACCMODE {
             libc::O_RDONLY => sftp::OpenFlag::READ,
@@ -679,34 +678,30 @@ impl Daemon {
         let mut attr = sftp::FileAttr::default();
         attr.permissions = Some(op.mode());
 
-        let handle = match self
-            .sftp
-            .open(&full_path, open_flags, &attr)
-            .await
-        {
+        let handle = match self.sftp.open(&path, open_flags, &attr).await {
             Ok(file) => file,
             Err(err) => {
-                tracing::error!("reply_err({:?})", err);
+                tracing::error!(?err);
                 return req.reply_error(sftp_error_to_errno(&err));
             }
         };
 
-        let stat = match self.sftp.lstat(&full_path).await {
+        let stat = match self.sftp.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => {
                 self.invoke_close(handle);
-                tracing::error!("reply_err({:?})", err);
+                tracing::error!(?err);
                 return req.reply_error(sftp_error_to_errno(&err));
             }
         };
-        tracing::debug!(?stat);
 
+        tracing::debug!(?path, attr = ?stat, "cache attr");
         let stat = Arc::new(stat);
-        self.attr_cache.insert(full_path.clone(), stat.clone());
+        self.attr_cache.insert(path.clone(), stat.clone());
 
-        let full_dirpath = self.base_dir.join(&dirpath);
-        let _ = self.attr_cache.remove(&full_dirpath);
-        let _ = self.dirent_cache.remove(&full_dirpath);
+        tracing::debug!(?parent_path, "invalidate cache");
+        self.attr_cache.remove(&parent_path);
+        self.dirent_cache.remove(&parent_path);
 
         let inode = self.path_table.recognize(&path);
 
@@ -781,10 +776,8 @@ impl Daemon {
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let full_path = self.base_dir.join(path);
-        tracing::debug!(?full_path);
-
-        let _ = self.attr_cache.remove(&full_path);
+        tracing::debug!(?path, "invalidate cache");
+        self.attr_cache.remove(path);
 
         let handle = match self.ensure_open(op.ino(), op.fh()).await {
             Ok(handle) => handle,
@@ -856,9 +849,7 @@ impl Daemon {
             Some(path) => path,
             None => return Err(libc::EINVAL),
         };
-
-        let full_path = self.base_dir.join(path);
-        tracing::debug!(?full_path);
+        tracing::debug!(?path);
 
         let (open_flags, sftp_handle) = match HandleRef::<FileHandle>::from_fh(fh) {
             Some(handle_ref) => (handle_ref.open_flags, handle_ref.handle.clone()),
@@ -870,11 +861,8 @@ impl Daemon {
             return Ok(sftp_handle);
         }
 
-        let sftp_handle = match self
-            .sftp
-            .open(&full_path, open_flags, &Default::default())
-            .await
-        {
+        let attr = Default::default();
+        let sftp_handle = match self.sftp.open(&path, open_flags, &attr).await {
             Ok(file) => file,
             Err(err) => return Err(sftp_error_to_errno(&err)),
         };

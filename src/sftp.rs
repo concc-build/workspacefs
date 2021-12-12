@@ -20,13 +20,14 @@ use std::{
         Arc, Weak,
     },
 };
+use std::path::Path;
+use std::path::PathBuf;
 use std::io::IoSlice;
 use tokio::{io::{AsyncReadExt, AsyncWrite, AsyncWriteExt}, process::Child, sync::{mpsc, oneshot}};
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::task::JoinHandle;
 use tracing::instrument;
-use tracing::Instrument as _;
 use crate::ssh;
 
 const SFTP_PROTOCOL_VERSION: u32 = 3;
@@ -237,6 +238,7 @@ pub struct FileHandle(Arc<OsStr>);
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
 pub struct Session {
+    base_path: PathBuf,
     inner: Weak<Inner>,
 }
 
@@ -260,12 +262,14 @@ impl Session {
     where
         P: AsRef<OsStr>,
     {
-        let filename = filename.as_ref().as_bytes();
-        let len = 8 + filename.len() + attrs.count_bytes();
+        let path = self.base_path.join(filename.as_ref());
+        let path = path.as_os_str().as_bytes();
+
+        let len = 8 + path.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(len);
-        payload.put_u32(filename.len() as u32);
-        payload.put(filename);
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
         payload.put_u32(pflags.bits());
         attrs.put_bytes(&mut payload);
 
@@ -431,20 +435,20 @@ impl Session {
     }
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
-    #[instrument(name = "sftp.lstat", level = "debug", skip_all,
-                 fields(?path))]
+    #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
     pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, Error>
     where
         P: AsRef<OsStr> + std::fmt::Debug,
     {
-        tracing::debug!("start");
-        let path = path.as_ref();
+        let path = self.base_path.join(path.as_ref());
+        tracing::debug!(?path);
+        let path = path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_LSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => {
@@ -459,7 +463,7 @@ impl Session {
     }
 
     /// Request to retrieve attribute values for a named file.
-    #[inline]
+    #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
     pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
         let payload_len = 4 + handle.0.as_bytes().len();
 
@@ -476,17 +480,20 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
     pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let path = self.base_path.join(path.as_ref());
+        tracing::debug!(?path);
+        let path = path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len() + attrs.count_bytes();
+        let payload_len = 4 + path.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_SETSTAT, vec![payload.freeze()]).await? {
@@ -498,6 +505,7 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
     pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), Error> {
         let payload_len = 4 + handle.0.as_bytes().len() + attrs.count_bytes();
 
@@ -516,17 +524,20 @@ impl Session {
     }
 
     /// Request to open a directory for reading.
+    #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
     pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let path = self.base_path.join(path.as_ref());
+        tracing::debug!(?path);
+        let path = path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_OPENDIR, vec![payload.freeze()]).await? {
             Response::Handle(handle) => Ok(handle),
@@ -538,6 +549,7 @@ impl Session {
     }
 
     /// Request to list files and directories contained in an opened directory.
+    #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
     pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
         let payload_len = 4 + handle.0.as_bytes().len();
 
@@ -554,17 +566,20 @@ impl Session {
         }
     }
 
-    pub async fn remove<P>(&self, filename: P) -> Result<(), Error>
+    #[instrument(name = "sftp.remove", level = "debug", skip_all)]
+    pub async fn remove<P>(&self, path: P) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
-        let filename = filename.as_ref();
+        let path = self.base_path.join(path.as_ref());
+        tracing::debug!(?path);
+        let path = path.as_os_str().as_bytes();
 
-        let payload_len = 4 + filename.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(filename.as_bytes().len() as u32);
-        payload.put(filename.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_REMOVE, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
@@ -575,17 +590,20 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
     pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let path = self.base_path.join(path.as_ref());
+        tracing::debug!(?path);
+        let path = path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len() + attrs.count_bytes();
+        let payload_len = 4 + path.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_MKDIR, vec![payload.freeze()]).await? {
@@ -597,17 +615,20 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
     pub async fn rmdir<P>(&self, path: P) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let remote_path = self.make_remote_path(path.as_ref());
+        tracing::debug!(?remote_path);
+        let path = remote_path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_RMDIR, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
@@ -618,17 +639,20 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
     pub async fn realpath<P>(&self, path: P) -> Result<OsString, Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let remote_path = self.make_remote_path(path.as_ref());
+        tracing::debug!(?remote_path);
+        let path = remote_path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_REALPATH, vec![payload.freeze()]).await? {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
@@ -640,18 +664,20 @@ impl Session {
     }
 
     /// Request to retrieve attribute values for a named file.
-    #[inline]
+    #[instrument(name = "sftp.stat", level = "debug", skip_all)]
     pub async fn stat<P>(&self, path: P) -> Result<FileAttr, Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let remote_path = self.make_remote_path(path.as_ref());
+        tracing::debug!(?remote_path);
+        let path = remote_path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_STAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
@@ -662,11 +688,8 @@ impl Session {
         }
     }
 
-    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
-        self.inner.upgrade().unwrap().has_extension(extension)
-    }
-
-    pub async fn rename<P>(&self, oldpath: P, newpath: P,) -> Result<(), Error>
+    #[instrument(name = "sftp.rename", level = "debug", skip_all)]
+    pub async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), Error>
     where
         P: AsRef<OsStr>,
     {
@@ -680,21 +703,23 @@ impl Session {
             (SSH_FXP_RENAME, 0)
         };
 
-        let oldpath = oldpath.as_ref();
-        let newpath = newpath.as_ref();
+        let old_remote_path = self.make_remote_path(old_path.as_ref());
+        let new_remote_path = self.make_remote_path(new_path.as_ref());
+        tracing::debug!(?old_remote_path, ?new_remote_path);
+        let old_path = old_remote_path.as_os_str().as_bytes();
+        let new_path = new_remote_path.as_os_str().as_bytes();
 
-        let payload_len = 8 + oldpath.as_bytes().len() + newpath.as_bytes().len()
-            + additioal_len;
+        let payload_len = 8 + old_path.len() + new_path.len() + additioal_len;
 
         let mut payload = BytesMut::with_capacity(payload_len);
         if type_ == SSH_FXP_EXTENDED {
             payload.put_u32(posix_rename_extension.0.as_bytes().len() as u32);
             payload.put(posix_rename_extension.0.as_bytes());
         }
-        payload.put_u32(oldpath.as_bytes().len() as u32);
-        payload.put(oldpath.as_bytes());
-        payload.put_u32(newpath.as_bytes().len() as u32);
-        payload.put(newpath.as_bytes());
+        payload.put_u32(old_path.len() as u32);
+        payload.put(old_path);
+        payload.put_u32(new_path.len() as u32);
+        payload.put(new_path);
 
         match self.request(type_, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
@@ -705,17 +730,20 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
     pub async fn readlink<P>(&self, path: P) -> Result<OsString, Error>
     where
         P: AsRef<OsStr>,
     {
-        let path = path.as_ref();
+        let remote_path = self.make_remote_path(path.as_ref());
+        tracing::debug!(?remote_path);
+        let path = remote_path.as_os_str().as_bytes();
 
-        let payload_len = 4 + path.as_bytes().len();
+        let payload_len = 4 + path.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(path.as_bytes().len() as u32);
-        payload.put(path.as_bytes());
+        payload.put_u32(path.len() as u32);
+        payload.put(path);
 
         match self.request(SSH_FXP_READLINK, vec![payload.freeze()]).await? {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
@@ -726,29 +754,33 @@ impl Session {
         }
     }
 
-    pub async fn symlink<P>(&self, linkpath: P, targetpath: P) -> Result<(), Error>
+    #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
+    pub async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<OsStr> + std::fmt::Debug,
+        Q: AsRef<OsStr> + std::fmt::Debug,
     {
-        let linkpath = linkpath.as_ref();
-        let targetpath = targetpath.as_ref();
+        let remote_path = self.make_remote_path(path.as_ref());
+        tracing::debug!(?remote_path, ?target_path);
+        let path = remote_path.as_os_str().as_bytes();
+        let target_path = target_path.as_ref().as_bytes();
 
-        let payload_len = 8 + linkpath.as_bytes().len() + targetpath.as_bytes().len();
+        let payload_len = 8 + path.len() + target_path.len();
 
         let reverse_symlink_arguments = self.inner
             .upgrade().ok_or(Error::SessionClosed)?.reverse_symlink_arguments;
 
         let mut payload = BytesMut::with_capacity(payload_len);
         if reverse_symlink_arguments {
-            payload.put_u32(targetpath.as_bytes().len() as u32);
-            payload.put(targetpath.as_bytes());
-            payload.put_u32(linkpath.as_bytes().len() as u32);
-            payload.put(linkpath.as_bytes());
+            payload.put_u32(target_path.len() as u32);
+            payload.put(target_path);
+            payload.put_u32(path.len() as u32);
+            payload.put(path);
         } else {
-            payload.put_u32(linkpath.as_bytes().len() as u32);
-            payload.put(linkpath.as_bytes());
-            payload.put_u32(targetpath.as_bytes().len() as u32);
-            payload.put(targetpath.as_bytes());
+            payload.put_u32(path.len() as u32);
+            payload.put(path);
+            payload.put_u32(target_path.len() as u32);
+            payload.put(target_path);
         }
 
         match self.request(SSH_FXP_SYMLINK, vec![payload.freeze()]).await? {
@@ -760,17 +792,18 @@ impl Session {
         }
     }
 
+    #[instrument(name = "sftp.extended", level = "debug", skip_all)]
     pub async fn extended<R>(&self, request: R, data: Bytes) -> Result<Vec<u8>, Error>
     where
         R: AsRef<OsStr>,
     {
-        let request = request.as_ref();
+        let request = request.as_ref().as_bytes();
 
-        let payload_len = 4 + request.as_bytes().len();
+        let payload_len = 4 + request.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(request.as_bytes().len() as u32);
-        payload.put(request.as_bytes());
+        payload.put_u32(request.len() as u32);
+        payload.put(request);
 
         match self.request(SSH_FXP_EXTENDED, vec![payload.freeze(), data]).await? {
             Response::Extended(data) => Ok(data.to_vec()),
@@ -779,6 +812,19 @@ impl Session {
                 msg: "incorrect response type".into(),
             }),
         }
+    }
+
+    #[inline]
+    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
+        self.inner.upgrade().unwrap().has_extension(extension)
+    }
+
+    #[inline]
+    fn make_remote_path<P>(&self, path: P) -> PathBuf
+    where
+        P: AsRef<Path>,
+    {
+        self.base_path.join(path.as_ref())
     }
 }
 
@@ -908,16 +954,21 @@ struct RemoteStatus {
 /// Start a SFTP session on the provided transport I/O.
 ///
 /// This is a shortcut to `InitSession::default().init(r, w)`.
-pub async fn init(
+pub async fn init<P>(
     ssh_command: &str,
     user: &str,
     host: &str,
     port: u16,
-) -> Result<Session, Error> {
+    path: P,
+) -> Result<Session, Error>
+where
+    P: AsRef<Path>,
+{
     let child = ssh::connect(ssh_command, user, host, port)
         .expect("failed to establish SSH connection");
     let conn = InitSession::default().init(child).await?;
     let se = Session {
+        base_path: path.as_ref().to_owned(),
         inner: Arc::downgrade(&conn.inner),
     };
     Ok(se)
@@ -1054,6 +1105,7 @@ impl InitSession {
     }
 }
 
+#[instrument(name = "sftp.send_loop", level = "debug", skip_all)]
 async fn send_loop(
     mut writer: ChildStdin,
     mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>
@@ -1082,6 +1134,7 @@ async fn send_loop(
     Ok(())
 }
 
+#[instrument(name = "sftp.recv_loop", level = "debug", skip_all)]
 async fn recv_loop(
     mut reader: ChildStdout,
     inner: Arc<Inner>
