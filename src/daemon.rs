@@ -1085,8 +1085,11 @@ impl PathTable {
 
     fn recognize(&mut self, path: &Path) -> &mut INode {
         match self.path_to_ino.get(path) {
-            Some(&ino) => self.inodes.get_mut(&ino).expect("inode is missing"),
-
+            Some(&ino) => {
+                let mut inode = self.inodes.get_mut(&ino).expect("inode is missing");
+                inode.refcount += 1;
+                inode
+            }
             None => {
                 let (ino, generation) = self.make_next_ino();
                 let inode = self.inodes.entry(ino).or_insert_with(|| INode {
