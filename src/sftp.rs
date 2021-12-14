@@ -5,26 +5,32 @@
 // * https://tools.ietf.org/html/rfc4251
 // * https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/sftp-server.c?rev=1.120&content-type=text/x-cvsweb-markup
 
+// Assumed that the text encoding in the remote server is UTF-8.
+
 #![allow(dead_code)]
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::Buf;
+use bytes::BufMut;
+use bytes::Bytes;
+use bytes::BytesMut;
 use dashmap::DashMap;
-use std::{
-    borrow::Cow,
-    ffi::{OsStr, OsString},
-    io,
-    mem,
-    os::unix::prelude::*,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, Weak,
-    },
-};
+use std::borrow::Cow;
 use std::fmt;
+use std::io;
+use std::io::IoSlice;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io::IoSlice;
-use tokio::{io::{AsyncReadExt, AsyncWrite, AsyncWriteExt}, process::Child, sync::{mpsc, oneshot}};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Weak;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Child;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::task::JoinHandle;
@@ -108,6 +114,13 @@ pub enum Error {
 
     #[error("session has already been closed")]
     SessionClosed,
+
+    #[error("locale error")]
+    Locale(
+        #[from]
+        #[source]
+        std::string::FromUtf8Error,
+    ),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,11 +132,11 @@ impl RemoteError {
         self.0.code
     }
 
-    pub fn message(&self) -> &OsStr {
+    pub fn message(&self) -> &str {
         &self.0.message
     }
 
-    pub fn language_tag(&self) -> &OsStr {
+    pub fn language_tag(&self) -> &str {
         &self.0.language_tag
     }
 }
@@ -136,7 +149,7 @@ pub struct FileAttr {
     pub uid_gid: Option<(u32, u32)>,
     pub permissions: Option<u32>,
     pub ac_mod_time: Option<(u32, u32)>,
-    pub extended: Vec<(OsString, OsString)>,
+    pub extended: Vec<(String, String)>,
 }
 
 impl FileAttr {
@@ -180,10 +193,7 @@ impl FileAttr {
         n
     }
 
-    fn put_bytes<B>(&self, mut b: B)
-    where
-        B: BufMut,
-    {
+    fn put_bytes(&self, b: &mut BytesMut) {
         #[inline(always)]
         fn flag(b: bool, flag: u32) -> u32 {
             if b {
@@ -250,13 +260,13 @@ impl fmt::Debug for FileAttr {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {
-    pub filename: OsString,
-    pub longname: OsString,
+    pub filename: String,
+    pub longname: String,
     pub attrs: FileAttr,
 }
 
 #[derive(Debug, Clone)]
-pub struct FileHandle(Arc<OsStr>);
+pub struct FileHandle(Bytes);
 
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
@@ -283,10 +293,10 @@ impl Session {
         attrs: &FileAttr,
     ) -> Result<FileHandle, Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(filename.as_ref());
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("").as_bytes();
 
         let len = 8 + path.len() + attrs.count_bytes();
 
@@ -307,11 +317,11 @@ impl Session {
 
     /// Request to close a file corresponding to the specified handle.
     pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
-        let len = 4 + handle.0.as_bytes().len();
+        let len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(len);
-        payload.put_u32(handle.0.as_bytes().len() as u32);
-        payload.put(handle.0.as_bytes());
+        payload.put_u32(handle.0.len() as u32);
+        payload.put(&handle.0[..]);
 
         match self.request(SSH_FXP_CLOSE, vec![payload.freeze()]).await? {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
@@ -324,27 +334,25 @@ impl Session {
 
     /// Request to read a range of data from an opened file corresponding to the specified handle.
     #[instrument(name = "sftp.read", level = "debug", skip_all,
-                 fields(handle = ?handle.0.as_bytes(), offset, len))]
+                 fields(handle = ?handle.0, offset, len))]
     pub async fn read(
         &self,
         handle: &FileHandle,
         offset: u64,
         len: u32,
-    ) -> Result<(usize, Vec<Vec<u8>>), Error> {
+    ) -> Result<(usize, Vec<Bytes>), Error> {
         let offset = offset as usize;
         let len = len as usize;
 
         // Read chunks in parallel.
-        let futs = (0..len as usize)
-            .step_by(MAX_READ)
-            .map(|pos| {
-                let chunk_len = if pos + MAX_READ > len {
-                    len - pos
-                } else {
-                    MAX_WRITE
-                };
-                self.read_chunk(handle, offset + pos, chunk_len)
-            });
+        let futs = (0..len).step_by(MAX_READ).map(|pos| {
+            let chunk_len = if pos + MAX_READ > len {
+                len - pos
+            } else {
+                MAX_WRITE
+            };
+            self.read_chunk(handle, offset + pos, chunk_len)
+        });
 
         let mut nread = 0;
         let mut chunks = Vec::with_capacity(futs.len());
@@ -371,17 +379,17 @@ impl Session {
         handle: &FileHandle,
         offset: usize,
         len: usize,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Bytes, Error> {
         assert!(offset <= u64::MAX as usize);
         assert!(len <= u32::MAX as usize);
 
         tracing::debug!(offset, len, "reading a chunk...");
 
-        let payload_len = 16 + handle.0.as_bytes().len();
+        let payload_len = 16 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.as_bytes().len() as u32);
-        payload.put(handle.0.as_bytes());
+        payload.put_u32(handle.0.len() as u32);
+        payload.put(&handle.0[..]);
         payload.put_u64(offset as u64);
         payload.put_u32(len as u32);
 
@@ -399,7 +407,7 @@ impl Session {
 
     /// Request to write a range of data to an opened file corresponding to the specified handle.
     #[instrument(name = "sftp.write", level = "debug", skip_all,
-                 fields(handle = ?handle.0.as_bytes(), offset, len = data.len()))]
+                 fields(handle = ?handle.0, offset, len = data.len()))]
     pub async fn write(
         &self,
         handle: &FileHandle,
@@ -437,11 +445,11 @@ impl Session {
     ) -> Result<(), Error> {
         tracing::debug!(offset, len = data.len(), "writing a chunk...");
 
-        let params_len = 16 + handle.0.as_bytes().len();
+        let params_len = 16 + handle.0.len();
 
         let mut params = BytesMut::with_capacity(params_len);
-        params.put_u32(handle.0.as_bytes().len() as u32);
-        params.put(handle.0.as_bytes());
+        params.put_u32(handle.0.len() as u32);
+        params.put(&handle.0[..]);
         params.put_u64(offset as u64);
         params.put_u32(data.len() as u32);
 
@@ -461,11 +469,11 @@ impl Session {
     #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
     pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, Error>
     where
-        P: AsRef<OsStr> + std::fmt::Debug,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("must be a UTF-8 string").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -488,11 +496,11 @@ impl Session {
     /// Request to retrieve attribute values for a named file.
     #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
     pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
-        let payload_len = 4 + handle.0.as_bytes().len();
+        let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.as_bytes().len() as u32);
-        payload.put(handle.0.as_bytes());
+        payload.put_u32(handle.0.len() as u32);
+        payload.put(&handle.0[..]);
 
         match self.request(SSH_FXP_FSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
@@ -506,11 +514,11 @@ impl Session {
     #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
     pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len() + attrs.count_bytes();
 
@@ -530,11 +538,11 @@ impl Session {
 
     #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
     pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), Error> {
-        let payload_len = 4 + handle.0.as_bytes().len() + attrs.count_bytes();
+        let payload_len = 4 + handle.0.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.as_bytes().len() as u32);
-        payload.put(handle.0.as_bytes());
+        payload.put_u32(handle.0.len() as u32);
+        payload.put(&handle.0[..]);
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_FSETSTAT, vec![payload.freeze()]).await? {
@@ -550,11 +558,11 @@ impl Session {
     #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
     pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -574,11 +582,11 @@ impl Session {
     /// Request to list files and directories contained in an opened directory.
     #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
     pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
-        let payload_len = 4 + handle.0.as_bytes().len();
+        let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.as_bytes().len() as u32);
-        payload.put(handle.0.as_bytes());
+        payload.put_u32(handle.0.len() as u32);
+        payload.put(&handle.0[..]);
 
         match self.request(SSH_FXP_READDIR, vec![payload.freeze()]).await? {
             Response::Name(entries) => Ok(entries),
@@ -592,11 +600,11 @@ impl Session {
     #[instrument(name = "sftp.remove", level = "debug", skip_all)]
     pub async fn remove<P>(&self, path: P) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -616,11 +624,11 @@ impl Session {
     #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
     pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
-        let path = path.as_os_str().as_bytes();
+        let path = path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len() + attrs.count_bytes();
 
@@ -641,11 +649,11 @@ impl Session {
     #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
     pub async fn rmdir<P>(&self, path: P) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let remote_path = self.make_remote_path(path.as_ref());
         tracing::debug!(?remote_path);
-        let path = remote_path.as_os_str().as_bytes();
+        let path = remote_path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -663,13 +671,13 @@ impl Session {
     }
 
     #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
-    pub async fn realpath<P>(&self, path: P) -> Result<OsString, Error>
+    pub async fn realpath<P>(&self, path: P) -> Result<String, Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let remote_path = self.make_remote_path(path.as_ref());
         tracing::debug!(?remote_path);
-        let path = remote_path.as_os_str().as_bytes();
+        let path = remote_path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -678,7 +686,8 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_REALPATH, vec![payload.freeze()]).await? {
-            Response::Name(mut entries) => Ok(entries.remove(0).filename),
+            Response::Name(mut entries) =>
+                Ok(mem::replace(&mut entries[0].filename, "".to_string())),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
@@ -690,11 +699,11 @@ impl Session {
     #[instrument(name = "sftp.stat", level = "debug", skip_all)]
     pub async fn stat<P>(&self, path: P) -> Result<FileAttr, Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let remote_path = self.make_remote_path(path.as_ref());
         tracing::debug!(?remote_path);
-        let path = remote_path.as_os_str().as_bytes();
+        let path = remote_path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -714,14 +723,13 @@ impl Session {
     #[instrument(name = "sftp.rename", level = "debug", skip_all)]
     pub async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
-        // TODO: should be const
-        let posix_rename_extension: (OsString, OsString) =
-            (OsString::from("posix-rename@openssh.com"), OsString::from("1"));
+        const POSIX_EXTENSION_RENAME: (&'static str, &'static str) =
+            ("posix-rename@openssh.com", "1");
 
-        let (type_, additioal_len) = if self.has_extension(&posix_rename_extension) {
-            (SSH_FXP_EXTENDED, 4 + posix_rename_extension.0.as_bytes().len())
+        let (type_, additioal_len) = if self.has_extension(&POSIX_EXTENSION_RENAME) {
+            (SSH_FXP_EXTENDED, 4 + POSIX_EXTENSION_RENAME.0.as_bytes().len())
         } else {
             (SSH_FXP_RENAME, 0)
         };
@@ -729,15 +737,15 @@ impl Session {
         let old_remote_path = self.make_remote_path(old_path.as_ref());
         let new_remote_path = self.make_remote_path(new_path.as_ref());
         tracing::debug!(?old_remote_path, ?new_remote_path);
-        let old_path = old_remote_path.as_os_str().as_bytes();
-        let new_path = new_remote_path.as_os_str().as_bytes();
+        let old_path = old_remote_path.to_str().expect("must be a valid Unicode").as_bytes();
+        let new_path = new_remote_path.to_str().expect("must be a valid Unicdoe").as_bytes();
 
         let payload_len = 8 + old_path.len() + new_path.len() + additioal_len;
 
         let mut payload = BytesMut::with_capacity(payload_len);
         if type_ == SSH_FXP_EXTENDED {
-            payload.put_u32(posix_rename_extension.0.as_bytes().len() as u32);
-            payload.put(posix_rename_extension.0.as_bytes());
+            payload.put_u32(POSIX_EXTENSION_RENAME.0.as_bytes().len() as u32);
+            payload.put(POSIX_EXTENSION_RENAME.0.as_bytes());
         }
         payload.put_u32(old_path.len() as u32);
         payload.put(old_path);
@@ -754,13 +762,13 @@ impl Session {
     }
 
     #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
-    pub async fn readlink<P>(&self, path: P) -> Result<OsString, Error>
+    pub async fn readlink<P>(&self, path: P) -> Result<String, Error>
     where
-        P: AsRef<OsStr>,
+        P: AsRef<Path>,
     {
         let remote_path = self.make_remote_path(path.as_ref());
         tracing::debug!(?remote_path);
-        let path = remote_path.as_os_str().as_bytes();
+        let path = remote_path.to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 4 + path.len();
 
@@ -780,13 +788,13 @@ impl Session {
     #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
     pub async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), Error>
     where
-        P: AsRef<OsStr> + std::fmt::Debug,
-        Q: AsRef<OsStr> + std::fmt::Debug,
+        P: AsRef<Path>,
+        Q: AsRef<Path> + fmt::Debug,
     {
         let remote_path = self.make_remote_path(path.as_ref());
         tracing::debug!(?remote_path, ?target_path);
-        let path = remote_path.as_os_str().as_bytes();
-        let target_path = target_path.as_ref().as_bytes();
+        let path = remote_path.to_str().expect("must be a valid Unicode").as_bytes();
+        let target_path = target_path.as_ref().to_str().expect("must be a valid Unicode").as_bytes();
 
         let payload_len = 8 + path.len() + target_path.len();
 
@@ -816,11 +824,8 @@ impl Session {
     }
 
     #[instrument(name = "sftp.extended", level = "debug", skip_all)]
-    pub async fn extended<R>(&self, request: R, data: Bytes) -> Result<Vec<u8>, Error>
-    where
-        R: AsRef<OsStr>,
-    {
-        let request = request.as_ref().as_bytes();
+    pub async fn extended<R>(&self, request: &str, data: Bytes) -> Result<Vec<u8>, Error> {
+        let request = request.as_bytes();
 
         let payload_len = 4 + request.len();
 
@@ -838,7 +843,7 @@ impl Session {
     }
 
     #[inline]
-    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
+    fn has_extension(&self, extension: &(&str, &str)) -> bool {
         self.inner.upgrade().unwrap().has_extension(extension)
     }
 
@@ -890,7 +895,7 @@ bitflags::bitflags! {
 
 #[derive(Debug)]
 struct Inner {
-    extensions: Vec<(OsString, OsString)>,
+    extensions: Vec<(String, String)>,
     reverse_symlink_arguments: bool,
     incoming_requests: mpsc::UnboundedSender<Vec<Bytes>>,
     pending_requests: DashMap<u32, oneshot::Sender<Response>>,
@@ -929,8 +934,8 @@ impl Inner {
         rx.await.map_err(|_| Error::SessionClosed)
     }
 
-    fn has_extension(&self, extension: &(OsString, OsString)) -> bool {
-        self.extensions.iter().any(|ext| ext == extension)
+    fn has_extension(&self, extension: &(&str, &str)) -> bool {
+        self.extensions.iter().any(|ext| ext.0 == extension.0 && ext.1 == extension.1)
     }
 }
 
@@ -952,7 +957,7 @@ enum Response {
     Handle(FileHandle),
 
     /// Received data.
-    Data(Vec<u8>),
+    Data(Bytes),
 
     /// Retrieved attribute values.
     Attrs(FileAttr),
@@ -970,8 +975,8 @@ enum Response {
 #[derive(Debug)]
 struct RemoteStatus {
     code: u32,
-    message: OsString,
-    language_tag: OsString,
+    message: String,
+    language_tag: String,
 }
 
 /// Start a SFTP session on the provided transport I/O.
@@ -1000,7 +1005,7 @@ where
 #[derive(Debug)]
 pub struct InitSession {
     reverse_symlink_arguments: bool,
-    extensions: Vec<(OsString, OsString)>,
+    extensions: Vec<(String, String)>,
 }
 
 impl Default for InitSession {
@@ -1026,7 +1031,7 @@ impl InitSession {
         self
     }
 
-    pub fn extension(&mut self, name: OsString, data: OsString) -> &mut Self {
+    pub fn extension(&mut self, name: String, data: String) -> &mut Self {
         self.extensions.push((name, data));
         self
     }
@@ -1046,7 +1051,7 @@ impl InitSession {
 
         // send SSH_FXP_INIT packet.
         let packet = {
-            let mut buf = vec![];
+            let mut buf = BytesMut::new();
             buf.put_u8(SSH_FXP_INIT);
             buf.put_u32(SFTP_PROTOCOL_VERSION);
             for (name, data) in &self.extensions {
@@ -1067,12 +1072,11 @@ impl InitSession {
             u32::from_be_bytes(buf)
         };
 
-        let packet = {
-            let mut buf = vec![0u8; length as usize];
-            reader.read_exact(&mut buf[..]).await?;
-            buf
+        let mut packet = {
+            let mut buf = BytesMut::with_capacity(length as usize);
+            reader.read_buf(&mut buf).await?;
+            buf.freeze()
         };
-        let mut packet = &packet[..];
 
         let typ = read_u8(&mut packet)?;
         if typ != SSH_FXP_VERSION {
@@ -1128,7 +1132,7 @@ impl InitSession {
     }
 }
 
-#[instrument(name = "sftp.send_loop", level = "debug", skip_all)]
+#[instrument(name = "sftp.send", level = "debug", skip_all)]
 async fn send_loop(
     mut writer: ChildStdin,
     mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>
@@ -1157,13 +1161,14 @@ async fn send_loop(
     Ok(())
 }
 
-#[instrument(name = "sftp.recv_loop", level = "debug", skip_all)]
+#[instrument(name = "sftp.recv", level = "debug", skip_all)]
 async fn recv_loop(
     mut reader: ChildStdout,
     inner: Arc<Inner>
 ) -> Result<(), Error> {
     loop {
         let length = reader.read_u32().await? as usize;
+        tracing::trace!(length);
 
         let mut buf = BytesMut::with_capacity(length);
         unsafe {
@@ -1173,13 +1178,14 @@ async fn recv_loop(
         reader.read_exact(&mut buf[..]).await?;
 
         let mut packet = buf.freeze();
-        let typ = read_u8(&mut packet)?;
+        let type_ = read_u8(&mut packet)?;
         let id = read_u32(&mut packet)?;
-        let response = match typ {
+        let response = match type_ {
             SSH_FXP_STATUS => {
                 let code = read_u32(&mut packet)?;
                 let message = read_string(&mut packet)?;
                 let language_tag = read_string(&mut packet)?;
+                tracing::trace!(id, r#type = "STATUS", code, ?message, ?language_tag);
                 Response::Status(RemoteStatus {
                     code,
                     message,
@@ -1187,15 +1193,18 @@ async fn recv_loop(
                 })
             }
             SSH_FXP_HANDLE => {
-                let handle = read_string(&mut packet)?;
-                Response::Handle(FileHandle(handle.into_boxed_os_str().into()))
+                let handle = read_bytes(&mut packet)?;
+                tracing::trace!(id, r#type = "HANDLE", ?handle);
+                Response::Handle(FileHandle(handle))
             }
             SSH_FXP_DATA => {
-                let data = read_string(&mut packet)?;
-                Response::Data(data.into_vec())
+                let data = read_bytes(&mut packet)?;
+                tracing::trace!(id, r#type = "DATA", len = data.len());
+                Response::Data(data)
             }
             SSH_FXP_ATTRS => {
                 let attrs = read_file_attr(&mut packet)?;
+                tracing::trace!(id, r#type = "ATTRS", ?attrs);
                 Response::Attrs(attrs)
             }
             SSH_FXP_NAME => {
@@ -1211,18 +1220,23 @@ async fn recv_loop(
                         attrs,
                     });
                 }
+                tracing::trace!(id, r#type = "NAME", count);
                 Response::Name(entries)
             }
             SSH_FXP_EXTENDED_REPLY => {
                 let data = packet.split_to(packet.len());
+                tracing::trace!(id, r#type = "EXTENDED_REPLY", len = data.len());
                 Response::Extended(data)
             }
             typ => {
                 let data = packet.split_to(packet.len());
+                tracing::trace!(id, r#type = "UNKNOWN", len = data.len());
                 Response::Unknown { typ, data }
             }
         };
-        debug_assert!(packet.is_empty());
+        if !packet.is_empty() {
+            tracing::warn!(id, r#type = type_, packet.remaining = packet.remaining());
+        }
 
         if let Some((_id, tx)) = inner.pending_requests.remove(&id) {
             let _ = tx.send(response);
@@ -1233,16 +1247,13 @@ async fn recv_loop(
 // ==== misc ====
 
 #[inline]
-fn put_string<B>(mut b: B, s: &[u8])
-where
-    B: BufMut,
-{
+fn put_string(b: &mut BytesMut, s: &[u8]) {
     b.put_u32(s.len() as u32);
     b.put(s);
 }
 
 #[inline]
-fn ensure_buf_remaining(b: &impl Buf, n: usize) -> Result<(), Error> {
+fn ensure_buf_remaining(b: &Bytes, n: usize) -> Result<(), Error> {
     if b.remaining() >= n {
         Ok(())
     } else {
@@ -1252,80 +1263,65 @@ fn ensure_buf_remaining(b: &impl Buf, n: usize) -> Result<(), Error> {
     }
 }
 
-fn read_u8<B>(mut b: B) -> Result<u8, Error>
-where
-    B: Buf,
-{
-    ensure_buf_remaining(&b, mem::size_of::<u8>())?;
-    let ret = b.chunk()[0];
-    b.advance(1);
-    Ok(ret)
+#[inline]
+fn read_u8(b: &mut Bytes) -> Result<u8, Error> {
+    ensure_buf_remaining(b, mem::size_of::<u8>())?;
+    Ok(b.get_u8())
 }
 
-fn read_u32<B>(mut b: B) -> Result<u32, Error>
-where
-    B: Buf,
-{
-    ensure_buf_remaining(&b, mem::size_of::<u32>())?;
-    let mut buf = [0u8; mem::size_of::<u32>()];
-    b.copy_to_slice(&mut buf[..]);
-    Ok(u32::from_be_bytes(buf))
+#[inline]
+fn read_u32(b: &mut Bytes) -> Result<u32, Error> {
+    ensure_buf_remaining(b, mem::size_of::<u32>())?;
+    Ok(b.get_u32())
 }
 
-fn read_u64<B>(mut b: B) -> Result<u64, Error>
-where
-    B: Buf,
-{
-    ensure_buf_remaining(&b, mem::size_of::<u64>())?;
-    let mut buf = [0u8; mem::size_of::<u64>()];
-    b.copy_to_slice(&mut buf[..]);
-    Ok(u64::from_be_bytes(buf))
+#[inline]
+fn read_u64(b: &mut Bytes) -> Result<u64, Error> {
+    ensure_buf_remaining(b, mem::size_of::<u64>())?;
+    Ok(b.get_u64())
 }
 
-fn read_string<B>(mut b: B) -> Result<OsString, Error>
-where
-    B: Buf,
-{
-    let len = read_u32(&mut b)?;
-    ensure_buf_remaining(&b, len as usize)?;
-
-    let mut buf = vec![0u8; len as usize];
-    b.copy_to_slice(&mut buf[..]);
-
-    Ok(OsString::from_vec(buf))
+#[inline]
+fn read_bytes(b: &mut Bytes) -> Result<Bytes, Error> {
+    let len = read_u32(b)? as usize;
+    ensure_buf_remaining(b, len)?;
+    Ok(b.split_to(len))
 }
 
-fn read_file_attr<B>(mut b: B) -> Result<FileAttr, Error>
-where
-    B: Buf,
-{
-    let flags = read_u32(&mut b)?;
+#[inline]
+fn read_string(b: &mut Bytes) -> Result<String, Error> {
+    let bytes = read_bytes(b)?;
+    Ok(String::from_utf8(bytes.as_ref().to_vec())?)
+}
+
+fn read_file_attr(b: &mut Bytes) -> Result<FileAttr, Error> {
+    let flags = read_u32(b)?;
 
     let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
-        let size = read_u64(&mut b)?;
+        let size = read_u64(b)?;
         Some(size)
     } else {
         None
     };
 
     let uid_gid = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
-        let uid = read_u32(&mut b)?;
-        let gid = read_u32(&mut b)?;
+        let uid = read_u32(b)?;
+        let gid = read_u32(b)?;
         Some((uid, gid))
     } else {
         None
     };
 
     let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
-        let perm = read_u32(&mut b)?;
+        let perm = read_u32(b)?;
         Some(perm)
     } else {
         None
     };
 
     let ac_mod_time = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
-        let atime = read_u32(&mut b)?;
-        let mtime = read_u32(&mut b)?;
+        let atime = read_u32(b)?;
+        let mtime = read_u32(b)?;
         Some((atime, mtime))
     } else {
         None
@@ -1334,10 +1330,10 @@ where
     let mut extended = vec![];
 
     if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
-        let count = read_u32(&mut b)?;
+        let count = read_u32(b)?;
         for _ in 0..count {
-            let ex_type = read_string(&mut b)?;
-            let ex_data = read_string(&mut b)?;
+            let ex_type = read_string(b)?;
+            let ex_data = read_string(b)?;
             extended.push((ex_type, ex_data));
         }
     }

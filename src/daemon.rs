@@ -9,7 +9,7 @@ use polyfuse::op;
 use polyfuse::reply::*;
 use static_assertions;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::mem;
@@ -589,7 +589,7 @@ impl Daemon {
         let mut nread = 0;
         let mut out = ReaddirOut::new(op.size() as usize);
         for (i, entry) in handle_ref.entries.iter().enumerate().skip(offset) {
-            if out.entry(&entry.name, entry.ino, entry.typ, (i + 1) as u64) {
+            if out.entry(OsStr::new(&entry.name), entry.ino, entry.typ, (i + 1) as u64) {
                 tracing::debug!("buffer fulled");
                 break;
             }
@@ -748,7 +748,12 @@ impl Daemon {
             let _ = match sftp.read(&handle, offset, size).await {
                 Ok((nread, chunks)) => {
                     tracing::debug!(nread);
-                    req.reply(chunks)
+                    // TODO: Vec<Bytes> has not implemented polyfuse::AtomicBytes at this point.
+                    req.reply(
+                        chunks
+                            .iter()
+                            .map(|chunk| chunk.as_ref())
+                            .collect::<Vec<&[u8]>>())
                 }
                 Err(err) => {
                     tracing::error!(?err);
@@ -959,7 +964,7 @@ impl<T> std::ops::DerefMut for HandleRef<T> {
 
 #[derive(Debug)]
 struct DirEntry {
-    name: OsString,
+    name: String,
     typ: u32,
     ino: u64,
 }
