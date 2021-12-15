@@ -9,7 +9,6 @@
 
 #![allow(dead_code)]
 
-use bytes::Buf;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -266,7 +265,7 @@ pub struct DirEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileHandle(Bytes);
+pub struct FileHandle(Vec<u8>);
 
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
@@ -340,7 +339,7 @@ impl Session {
         handle: &FileHandle,
         offset: u64,
         len: u32,
-    ) -> Result<(usize, Vec<Bytes>), Error> {
+    ) -> Result<(usize, Vec<Vec<u8>>), Error> {
         let offset = offset as usize;
         let len = len as usize;
 
@@ -379,7 +378,7 @@ impl Session {
         handle: &FileHandle,
         offset: usize,
         len: usize,
-    ) -> Result<Bytes, Error> {
+    ) -> Result<Vec<u8>, Error> {
         assert!(offset <= u64::MAX as usize);
         assert!(len <= u32::MAX as usize);
 
@@ -957,7 +956,7 @@ enum Response {
     Handle(FileHandle),
 
     /// Received data.
-    Data(Bytes),
+    Data(Vec<u8>),
 
     /// Retrieved attribute values.
     Attrs(FileAttr),
@@ -966,10 +965,10 @@ enum Response {
     Name(Vec<DirEntry>),
 
     /// Reply from an vendor-specific extended request.
-    Extended(Bytes),
+    Extended(Vec<u8>),
 
     /// The response type is unknown or currently not supported.
-    Unknown { typ: u8, data: Bytes },
+    Unknown { typ: u8, data: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -1050,55 +1049,52 @@ impl InitSession {
         let mut writer = child.stdin.take().expect("missing stdin pipe");
 
         // send SSH_FXP_INIT packet.
-        let packet = {
-            let mut buf = BytesMut::new();
-            buf.put_u8(SSH_FXP_INIT);
-            buf.put_u32(SFTP_PROTOCOL_VERSION);
-            for (name, data) in &self.extensions {
-                put_string(&mut buf, name.as_bytes());
-                put_string(&mut buf, data.as_bytes());
-            }
-            buf
-        };
-        let length = packet.len() as u32;
-        writer.write_all(&length.to_be_bytes()).await?;
-        writer.write_all(&packet[..]).await?;
-        writer.flush().await?;
+        {
+            let packet = {
+                let mut buf = BytesMut::new();
+                buf.put_u8(SSH_FXP_INIT);
+                buf.put_u32(SFTP_PROTOCOL_VERSION);
+                for (name, data) in &self.extensions {
+                    put_string(&mut buf, name.as_bytes());
+                    put_string(&mut buf, data.as_bytes());
+                }
+                buf
+            };
+            let length = packet.len() as u32;
+            writer.write_u32(length as u32).await?;
+            writer.write_all(&packet[..]).await?;
+            writer.flush().await?;
+        }
 
         // receive SSH_FXP_VERSION packet.
-        let length = {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf[..]).await?;
-            u32::from_be_bytes(buf)
+        let (version, extensions) = {
+            let length = reader.read_u32().await? as usize;
+
+            let mut packet = PacketReader::new(&mut reader, length);
+
+            let typ = packet.read_u8().await?;
+            if typ != SSH_FXP_VERSION {
+                return Err(Error::Protocol {
+                    msg: "incorrect message type during initialization".into(),
+                });
+            }
+
+            let version = packet.read_u32().await?;
+            if version < SFTP_PROTOCOL_VERSION {
+                return Err(Error::Protocol {
+                    msg: "server supports older SFTP protocol".into(),
+                });
+            }
+
+            let mut extensions = vec![];
+            while packet.remaining > 0 {
+                let name = packet.read_string().await?;
+                let data = packet.read_string().await?;
+                extensions.push((name, data));
+            }
+
+            (version, extensions)
         };
-
-        let mut packet = {
-            let mut buf = BytesMut::with_capacity(length as usize);
-            reader.read_buf(&mut buf).await?;
-            buf.freeze()
-        };
-
-        let typ = read_u8(&mut packet)?;
-        if typ != SSH_FXP_VERSION {
-            return Err(Error::Protocol {
-                msg: "incorrect message type during initialization".into(),
-            });
-        }
-
-        let version = read_u32(&mut packet)?;
-        if version < SFTP_PROTOCOL_VERSION {
-            return Err(Error::Protocol {
-                msg: "server supports older SFTP protocol".into(),
-            });
-        }
-
-        let mut extensions = vec![];
-        while !packet.is_empty() {
-            let name = read_string(&mut packet)?;
-            let data = read_string(&mut packet)?;
-            extensions.push((name, data));
-        }
-
         tracing::debug!(version);
         tracing::debug!(?extensions);
 
@@ -1168,23 +1164,18 @@ async fn recv_loop(
 ) -> Result<(), Error> {
     loop {
         let length = reader.read_u32().await? as usize;
-        tracing::trace!(length);
+        tracing::trace!(packet.length = length);
+        assert!(length >= 5);
 
-        let mut buf = BytesMut::with_capacity(length);
-        unsafe {
-            buf.set_len(length);
-        }
+        let mut packet = PacketReader::new(&mut reader, length);
+        let type_ = packet.read_u8().await?;
+        let id = packet.read_u32().await?;
 
-        reader.read_exact(&mut buf[..]).await?;
-
-        let mut packet = buf.freeze();
-        let type_ = read_u8(&mut packet)?;
-        let id = read_u32(&mut packet)?;
         let response = match type_ {
             SSH_FXP_STATUS => {
-                let code = read_u32(&mut packet)?;
-                let message = read_string(&mut packet)?;
-                let language_tag = read_string(&mut packet)?;
+                let code = packet.read_u32().await?;
+                let message = packet.read_string().await?;
+                let language_tag = packet.read_string().await?;
                 tracing::trace!(id, r#type = "STATUS", code, ?message, ?language_tag);
                 Response::Status(RemoteStatus {
                     code,
@@ -1193,27 +1184,27 @@ async fn recv_loop(
                 })
             }
             SSH_FXP_HANDLE => {
-                let handle = read_bytes(&mut packet)?;
+                let handle = packet.read_bytes().await?;
                 tracing::trace!(id, r#type = "HANDLE", ?handle);
                 Response::Handle(FileHandle(handle))
             }
             SSH_FXP_DATA => {
-                let data = read_bytes(&mut packet)?;
+                let data = packet.read_bytes().await?;
                 tracing::trace!(id, r#type = "DATA", len = data.len());
                 Response::Data(data)
             }
             SSH_FXP_ATTRS => {
-                let attrs = read_file_attr(&mut packet)?;
+                let attrs = packet.read_attr().await?;
                 tracing::trace!(id, r#type = "ATTRS", ?attrs);
                 Response::Attrs(attrs)
             }
             SSH_FXP_NAME => {
-                let count = read_u32(&mut packet)?;
-                let mut entries = Vec::with_capacity(count as usize);
+                let count = packet.read_u32().await? as usize;
+                let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let filename = read_string(&mut packet)?;
-                    let longname = read_string(&mut packet)?;
-                    let attrs = read_file_attr(&mut packet)?;
+                    let filename = packet.read_string().await?;
+                    let longname = packet.read_string().await?;
+                    let attrs = packet.read_attr().await?;
                     entries.push(DirEntry {
                         filename,
                         longname,
@@ -1224,22 +1215,161 @@ async fn recv_loop(
                 Response::Name(entries)
             }
             SSH_FXP_EXTENDED_REPLY => {
-                let data = packet.split_to(packet.len());
+                let data = packet.read_to_end().await?;
                 tracing::trace!(id, r#type = "EXTENDED_REPLY", len = data.len());
                 Response::Extended(data)
             }
             typ => {
-                let data = packet.split_to(packet.len());
+                let data = packet.read_to_end().await?;
                 tracing::trace!(id, r#type = "UNKNOWN", len = data.len());
                 Response::Unknown { typ, data }
             }
         };
-        if !packet.is_empty() {
-            tracing::warn!(id, r#type = type_, packet.remaining = packet.remaining());
+        if packet.remaining > 0 {
+            tracing::warn!(id, r#type = type_, packet.remaining = packet.remaining);
+            let _ = packet.read_to_end().await?;
         }
 
         if let Some((_id, tx)) = inner.pending_requests.remove(&id) {
             let _ = tx.send(response);
+        }
+    }
+}
+
+struct PacketReader<'a, R> {
+    inner: &'a mut R,
+    remaining: usize,
+}
+
+impl<'a, R> PacketReader<'a, R>
+where
+    R: AsyncReadExt + Unpin,
+{
+    #[inline]
+    fn new(inner: &'a mut R, remaining: usize) -> Self {
+        Self {
+            inner,
+            remaining,
+        }
+    }
+
+    async fn read_attr(&mut self) -> Result<FileAttr, Error> {
+        let flags = self.read_u32().await?;
+
+        let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
+            let size = self.read_u64().await?;
+            Some(size)
+        } else {
+            None
+        };
+
+        let uid_gid = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+            let uid = self.read_u32().await?;
+            let gid = self.read_u32().await?;
+            Some((uid, gid))
+        } else {
+            None
+        };
+
+        let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+            let perm = self.read_u32().await?;
+            Some(perm)
+        } else {
+            None
+        };
+
+        let ac_mod_time = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+            let atime = self.read_u32().await?;
+            let mtime = self.read_u32().await?;
+            Some((atime, mtime))
+        } else {
+            None
+        };
+
+        let mut extended = vec![];
+
+        if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
+            let count = self.read_u32().await? as usize;
+            for _ in 0..count {
+                let ex_type = self.read_string().await?;
+                let ex_data = self.read_string().await?;
+                extended.push((ex_type, ex_data));
+            }
+        }
+
+        Ok(FileAttr {
+            size,
+            uid_gid,
+            permissions,
+            ac_mod_time,
+            extended,
+        })
+    }
+
+    #[inline]
+    async fn read_to_end(&mut self) -> Result<Vec<u8>, Error> {
+        self.read_exact(self.remaining).await
+    }
+
+    #[inline]
+    async fn read_bytes(&mut self) -> Result<Vec<u8>, Error> {
+        let len = self.read_u32().await? as usize;
+        self.read_exact(len).await
+    }
+
+    #[inline]
+    async fn read_string(&mut self) -> Result<String, Error> {
+        let v = self.read_bytes().await?;
+        Ok(String::from_utf8(v)?)
+    }
+
+    #[inline]
+    async fn read_u8(&mut self) -> Result<u8, Error> {
+        const N: usize = mem::size_of::<u8>();
+        self.ensure(N)?;
+        let v = self.inner.read_u8().await?;
+        self.remaining -= N;
+        Ok(v)
+    }
+
+    #[inline]
+    async fn read_u32(&mut self) -> Result<u32, Error> {
+        const N: usize = mem::size_of::<u32>();
+        self.ensure(N)?;
+        let v = self.inner.read_u32().await?;
+        self.remaining -= N;
+        Ok(v)
+    }
+
+    #[inline]
+    async fn read_u64(&mut self) -> Result<u64, Error> {
+        const N: usize = mem::size_of::<u64>();
+        self.ensure(N)?;
+        let v = self.inner.read_u64().await?;
+        self.remaining -= N;
+        Ok(v)
+    }
+
+    #[inline]
+    async fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, Error> {
+        self.ensure(n)?;
+        let mut v = Vec::with_capacity(n);
+        unsafe {
+            v.set_len(n);
+        }
+        self.inner.read_exact(&mut v[..]).await?;
+        self.remaining -= n;
+        Ok(v)
+    }
+
+    #[inline]
+    fn ensure(&self, n: usize) -> Result<(), Error> {
+        if self.remaining >= n {
+            Ok(())
+        } else {
+            Err(Error::Protocol {
+                msg: "too short data".into(),
+            })
         }
     }
 }
@@ -1250,99 +1380,4 @@ async fn recv_loop(
 fn put_string(b: &mut BytesMut, s: &[u8]) {
     b.put_u32(s.len() as u32);
     b.put(s);
-}
-
-#[inline]
-fn ensure_buf_remaining(b: &Bytes, n: usize) -> Result<(), Error> {
-    if b.remaining() >= n {
-        Ok(())
-    } else {
-        Err(Error::Protocol {
-            msg: "too short data".into(),
-        })
-    }
-}
-
-#[inline]
-fn read_u8(b: &mut Bytes) -> Result<u8, Error> {
-    ensure_buf_remaining(b, mem::size_of::<u8>())?;
-    Ok(b.get_u8())
-}
-
-#[inline]
-fn read_u32(b: &mut Bytes) -> Result<u32, Error> {
-    ensure_buf_remaining(b, mem::size_of::<u32>())?;
-    Ok(b.get_u32())
-}
-
-#[inline]
-fn read_u64(b: &mut Bytes) -> Result<u64, Error> {
-    ensure_buf_remaining(b, mem::size_of::<u64>())?;
-    Ok(b.get_u64())
-}
-
-#[inline]
-fn read_bytes(b: &mut Bytes) -> Result<Bytes, Error> {
-    let len = read_u32(b)? as usize;
-    ensure_buf_remaining(b, len)?;
-    Ok(b.split_to(len))
-}
-
-#[inline]
-fn read_string(b: &mut Bytes) -> Result<String, Error> {
-    let bytes = read_bytes(b)?;
-    Ok(String::from_utf8(bytes.as_ref().to_vec())?)
-}
-
-fn read_file_attr(b: &mut Bytes) -> Result<FileAttr, Error> {
-    let flags = read_u32(b)?;
-
-    let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
-        let size = read_u64(b)?;
-        Some(size)
-    } else {
-        None
-    };
-
-    let uid_gid = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
-        let uid = read_u32(b)?;
-        let gid = read_u32(b)?;
-        Some((uid, gid))
-    } else {
-        None
-    };
-
-    let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
-        let perm = read_u32(b)?;
-        Some(perm)
-    } else {
-        None
-    };
-
-    let ac_mod_time = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
-        let atime = read_u32(b)?;
-        let mtime = read_u32(b)?;
-        Some((atime, mtime))
-    } else {
-        None
-    };
-
-    let mut extended = vec![];
-
-    if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
-        let count = read_u32(b)?;
-        for _ in 0..count {
-            let ex_type = read_string(b)?;
-            let ex_data = read_string(b)?;
-            extended.push((ex_type, ex_data));
-        }
-    }
-
-    Ok(FileAttr {
-        size,
-        uid_gid,
-        permissions,
-        ac_mod_time,
-        extended,
-    })
 }

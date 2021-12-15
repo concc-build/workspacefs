@@ -748,12 +748,7 @@ impl Daemon {
             let _ = match sftp.read(&handle, offset, size).await {
                 Ok((nread, chunks)) => {
                     tracing::debug!(nread);
-                    // TODO: Vec<Bytes> has not implemented polyfuse::AtomicBytes at this point.
-                    req.reply(
-                        chunks
-                            .iter()
-                            .map(|chunk| chunk.as_ref())
-                            .collect::<Vec<&[u8]>>())
+                    req.reply(chunks)
                 }
                 Err(err) => {
                     tracing::error!(?err);
