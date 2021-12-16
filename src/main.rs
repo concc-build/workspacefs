@@ -1,85 +1,19 @@
+mod config;
 mod daemon;
 mod fs;
 mod sftp;
 mod ssh;
 
-use anyhow::{ensure, Context as _, Result};
-use humantime::parse_duration;
+use anyhow::Context as _;
+use anyhow::Result;
 use std::path::PathBuf;
-use std::time::Duration;
 use structopt::StructOpt;
-use url::Url;
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// FUSE mount options.
-    #[structopt(short, number_of_values = 1)]
-    options: Vec<String>,
-
-    /// Cache timeout for directory entries.
-    ///
-    /// A value is represented with a concatenation of time spans.  Where each
-    /// time span is an integer number and a suffix.  Supported suffixes:
-    ///
-    ///   * nsec, ns -- nanoseconds
-    ///   * usec, us -- microseconds
-    ///   * msec, ms -- milliseconds
-    ///   * seconds, second, sec, s
-    ///   * minutes, minute, min, m
-    ///   * hours, hour, hr, h
-    ///   * days, day, d
-    ///   * weeks, week, w
-    ///   * months, month, M -- defined as 30.44 days
-    ///   * years, year, y -- defined as 365.25 days
-    ///
-    /// "0<suffix>" means that caching is disabled.
-    #[structopt(
-        short = "E",
-        long,
-        default_value = "0s",
-        parse(try_from_str = parse_duration),
-        verbatim_doc_comment)]
-    entry_timeout: Duration,
-
-    /// Cache timeout for file attributes.
-    #[structopt(
-        short = "A",
-        long,
-        default_value = "0s",
-        parse(try_from_str = parse_duration),
-        verbatim_doc_comment)]
-    attr_timeout: Duration,
-
-    /// Cache timeout for negative lookups.
-    #[structopt(
-        short = "N",
-        long,
-        default_value = "0s",
-        parse(try_from_str = parse_duration),
-        verbatim_doc_comment)]
-    negative_timeout: Duration,
-
-    /// Glob patterns of paths excluded from negative lookup caching.
-    #[structopt(short = "X", long, number_of_values = 1)]
-    negative_xglobs: Vec<String>,
-
-    /// SSH command to be executed for establishing a connection.
-    ///
-    /// Additional SSH options will be added after the command string.
-    #[structopt(long, default_value = "ssh")]
-    ssh_command: String,
-
-    /// Absolute path to fusermount or fusermount3.
-    #[structopt(long, parse(from_os_str))]
-    fusermount_path: Option<PathBuf>,
-
-    /// URL of the target directory on the remote host like sftp://user@remote/path/to/dir.
-    #[structopt(parse(try_from_str = Url::parse))]
-    remote: Url,
-
     /// Mount point.
     #[structopt(parse(from_os_str))]
     mountpoint: PathBuf,
@@ -94,21 +28,13 @@ async fn main() -> Result<()> {
         .init();
 
     let opt = Opt::from_args();
+    let config = config::load(&opt.mountpoint)?;
 
-    ensure!(opt.remote.scheme() == "sftp", "remote url must be a sftp URL");
-    ensure!(!opt.remote.username().is_empty(), "remote url must has an username part");
-    ensure!(opt.remote.has_host(), "remote url must has a host part");
-    ensure!(opt.mountpoint.is_dir(), "mountpoint must be a directory");
-
-    let sftp_user = opt.remote.username();
-    let sftp_host = opt.remote.host_str().unwrap();
-    let sftp_port = opt.remote.port().unwrap_or(22);
-    let sftp_path = opt.remote.path();
-
-    let sftp = sftp::init(
-        &opt.ssh_command, sftp_user, sftp_host, sftp_port, sftp_path)
-        .await
-        .context("failed to initialize SFTP session")?;
+    let remote = match config.remote {
+        config::RemoteConfig::Sftp(ref config) => {
+            sftp::init(config).await.context("failed to initialize SFTP session")?
+        }
+    };
 
     // let stat = sftp
     //     .lstat(&args.base_dir)
@@ -116,12 +42,12 @@ async fn main() -> Result<()> {
     //     .context("failed to get target attribute")?;
     // ensure!(stat.is_dir(), "the target path is not directory");
 
-    let (sender, daemon) = daemon::init(&opt, sftp)?;
+    let (sender, daemon) = daemon::init(&config, remote)?;
     tokio::spawn(async move {
         let _ = daemon.run().await;
     });
 
-    fs::mount(&opt, sender).await?;
+    fs::mount(&opt.mountpoint, &config.mount, sender).await?;
 
     Ok(())
 }

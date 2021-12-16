@@ -6,28 +6,37 @@ use polyfuse::KernelConfig;
 use polyfuse::Request;
 use polyfuse::Session;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::task::Poll;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
-use crate::Opt;
+use crate::config::MountConfig;
 use crate::daemon::Message;
 
-pub(crate) async fn mount(opt: &Opt, sender: Sender<Message>) -> Result<()> {
-    let fuse = AsyncSession::mount(opt.mountpoint.clone(), {
-        let mut config = KernelConfig::default();
-        config.mount_option("fsname=sshfs");
-        config.mount_option("default_permissions");
-        for mount_option in opt.options.iter() {
-            config.mount_option(mount_option);
+pub(crate) async fn mount<P>(
+    mountpoint: P,
+    config: &MountConfig,
+    sender: Sender<Message>
+) -> Result<()>
+where
+    P: AsRef<Path>,
+{
+    let fuse = AsyncSession::mount(mountpoint.as_ref().to_owned(), {
+        let mut kconfig = KernelConfig::default();
+        kconfig.mount_option("fsname=sshfs");
+        kconfig.mount_option("default_permissions");
+        kconfig.mount_option("nonempty");
+        for mount_option in config.options.iter() {
+            kconfig.mount_option(mount_option);
         }
-        if let Some(ref fusermount_path) = opt.fusermount_path {
-            config.fusermount_path(fusermount_path);
+        if let Some(ref fusermount) = config.fusermount {
+            kconfig.fusermount_path(fusermount);
         }
         // SFTP only supports 1-second time resolution.
-        config.time_gran(1000000000);
-        config
+        kconfig.time_gran(1000000000);
+        kconfig
     })
     .await
     .context("failed to start FUSE session")?;

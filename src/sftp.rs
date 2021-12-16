@@ -35,6 +35,7 @@ use tokio::process::ChildStdout;
 use tokio::task::JoinHandle;
 use tracing::instrument;
 use crate::ssh;
+use crate::config::SftpConfig;
 
 const SFTP_PROTOCOL_VERSION: u32 = 3;
 
@@ -981,28 +982,20 @@ struct RemoteStatus {
 /// Start a SFTP session on the provided transport I/O.
 ///
 /// This is a shortcut to `InitSession::default().init(r, w)`.
-pub async fn init<P>(
-    ssh_command: &str,
-    user: &str,
-    host: &str,
-    port: u16,
-    path: P,
-) -> Result<Session, Error>
-where
-    P: AsRef<Path>,
-{
-    let child = ssh::connect(ssh_command, user, host, port)
+pub(crate) async fn init(config: &SftpConfig) -> Result<Session, Error> {
+    let child = ssh::connect(
+        &config.ssh_command, &config.user, &config.host, config.port)
         .expect("failed to establish SSH connection");
     let conn = InitSession::default().init(child).await?;
     let se = Session {
-        base_path: path.as_ref().to_owned(),
+        base_path: config.path.clone(),
         inner: Arc::downgrade(&conn.inner),
     };
     Ok(se)
 }
 
 #[derive(Debug)]
-pub struct InitSession {
+struct InitSession {
     reverse_symlink_arguments: bool,
     extensions: Vec<(String, String)>,
 }

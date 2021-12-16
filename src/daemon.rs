@@ -24,15 +24,15 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tracing;
 use tracing::Instrument;
-use crate::Opt;
+use crate::config::Config;
 use crate::sftp;
 
 pub(crate) fn init(
-    opt: &Opt,
+    config: &Config,
     sftp: sftp::Session,
 ) -> Result<(Sender<Message>, Daemon)> {
     let (sender, receiver) = mpsc::channel(100);
-    Ok((sender, Daemon::new(opt, sftp, receiver)?))
+    Ok((sender, Daemon::new(config, sftp, receiver)?))
 }
 
 pub(crate) enum Message {
@@ -66,21 +66,21 @@ pub(crate) struct Daemon {
 
 impl Daemon {
     pub(crate) fn new(
-        opt: &Opt,
+        config: &Config,
         sftp: sftp::Session,
         receiver: Receiver<Message>,
     ) -> Result<Self> {
         let mut globset_builder = GlobSetBuilder::new();
-        for glob in opt.negative_xglobs.iter() {
+        for glob in config.cache.negative.excludes.iter() {
             globset_builder.add(Glob::new(glob)?);
         }
         Ok(Self {
             sftp,
             receiver,
             path_table: PathTable::new(),
-            entry_timeout: opt.entry_timeout,
-            attr_timeout: opt.attr_timeout,
-            negative_timeout: opt.negative_timeout,
+            entry_timeout: config.cache.entry.timeout.clone().into(),
+            attr_timeout: config.cache.attr.timeout.clone().into(),
+            negative_timeout: config.cache.negative.timeout.clone().into(),
             attr_cache: HashMap::new(),
             dirent_cache: HashMap::new(),
             negative_xglobset: globset_builder.build()?,

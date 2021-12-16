@@ -70,17 +70,13 @@ pub(crate) fn connect(
 ) -> Result<Child> {
     let words = shell_words::split(command)?;
     let (prog, args) = words.split_first().unwrap();
+    let extra = format!("-sx -p {} -- {}@{} sftp", port, user, host);
+    let extra_args = shell_words::split(&extra)?;
     let mut cmd = Command::new(&prog);
-    cmd.args(args)
-        .arg("-sx")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("--")
-        .arg(format!("{}@{}", user, host))
-        .arg("sftp")
+    cmd.args(args).args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
 
-    tracing::debug!("spawn {:?}", cmd);
+    tracing::debug!("spawn `<ssh-command> {}`", extra);
     Ok(cmd.spawn().context("failed to spawn ssh")?)
 }
