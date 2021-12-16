@@ -1135,14 +1135,14 @@ async fn send_loop(
 ) -> Result<(), Error> {
     while let Some(iovec) = rx.recv().await {
         let nwritten = if writer.is_write_vectored() {
-            tracing::debug!("Sending with write_vectored...");
+            tracing::trace!("Sending with write_vectored...");
             let mut slices: Vec<IoSlice<'_>> = iovec
                 .iter()
                 .map(|buf| IoSlice::new(buf.as_ref()))
                 .collect();
             writer.write_vectored(&mut slices).await?
         } else {
-            tracing::debug!("Sending with write_all...");
+            tracing::trace!("Sending with write_all...");
             let mut nwritten = 0;
             for buf in iovec.into_iter() {
                 nwritten += buf.len();
@@ -1151,7 +1151,7 @@ async fn send_loop(
             nwritten
         };
         writer.flush().await?;
-        tracing::debug!("Sent {} bytes", nwritten);
+        tracing::trace!("Sent {} bytes", nwritten);
     }
 
     Ok(())
