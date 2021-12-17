@@ -1087,5 +1087,9 @@ impl PathTable {
         }
         let ino = self.path_to_ino.remove(old).expect("ino is missing");
         self.path_to_ino.insert(new.to_owned(), ino);
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.path = new.to_owned();
+        }
+        tracing::debug!(?new, ino, "inserted");
     }
 }
