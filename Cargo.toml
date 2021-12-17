@@ -27,7 +27,7 @@ structopt = "0.3.25"
 thiserror = "1.0.30"
 tokio = { version = "1.14.0", features = [ "full" ] }
 tracing = { version = "0.1.29", features = ["attributes"] }
-tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.2", features = ["env-filter", "json"] }
 
 [profile.release]
 debug = true

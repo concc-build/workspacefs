@@ -97,27 +97,26 @@ impl Daemon {
         Ok(())
     }
 
-    #[tracing::instrument(name = "handle_request", level = "debug", skip_all,
-                          fields(id = req.unique()))]
+    #[tracing::instrument(level = "debug", skip_all, fields(id = req.unique(), uid = req.uid(), gid = req.gid(), pid = req.pid()))]
     pub async fn handle_request(&mut self, req: Request) -> Result<()> {
         match req.operation()? {
-            Operation::Lookup(op) => self.do_lookup(&req, op).await?,
-            Operation::Forget(forgets) => self.do_forget(forgets.as_ref()),
-            Operation::Getattr(op) => self.do_getattr(&req, op).await?,
-            Operation::Setattr(op) => self.do_setattr(&req, op).await?,
-            Operation::Readlink(op) => self.do_readlink(&req, op).await?,
-            Operation::Symlink(op) => self.do_symlink(&req, op).await?,
-            Operation::Unlink(op) => self.do_unlink(&req, op).await?,
-            Operation::Rename(op) => self.do_rename(&req, op).await?,
-            Operation::Opendir(op) => self.do_opendir(&req, op).await?,
-            Operation::Readdir(op) => self.do_readdir(&req, op)?,
-            Operation::Releasedir(op) => self.do_releasedir(&req, op)?,
-            Operation::Open(op) => self.do_open(&req, op)?,
-            Operation::Create(op) => self.do_create(&req, op).await?,
-            Operation::Read(op) => self.do_read(&req, op).await?,
-            Operation::Write(op, data) => self.do_write(&req, op, data).await?,
-            Operation::Release(op) => self.do_release(&req, op)?,
-            Operation::Interrupt(op) => self.do_interrupt(&req,op)?,
+            Operation::Lookup(op) => self.lookup(&req, op).await?,
+            Operation::Forget(forgets) => self.forget(forgets.as_ref()),
+            Operation::Getattr(op) => self.getattr(&req, op).await?,
+            Operation::Setattr(op) => self.setattr(&req, op).await?,
+            Operation::Readlink(op) => self.readlink(&req, op).await?,
+            Operation::Symlink(op) => self.symlink(&req, op).await?,
+            Operation::Unlink(op) => self.unlink(&req, op).await?,
+            Operation::Rename(op) => self.rename(&req, op).await?,
+            Operation::Opendir(op) => self.opendir(&req, op).await?,
+            Operation::Readdir(op) => self.readdir(&req, op)?,
+            Operation::Releasedir(op) => self.releasedir(&req, op)?,
+            Operation::Open(op) => self.open(&req, op)?,
+            Operation::Create(op) => self.create(&req, op).await?,
+            Operation::Read(op) => self.read(&req, op).await?,
+            Operation::Write(op, data) => self.write(&req, op, data).await?,
+            Operation::Release(op) => self.release(&req, op)?,
+            Operation::Interrupt(op) => self.interrupt(&req,op)?,
 
             op @ _ => {
                 tracing::trace!(?op);
@@ -128,9 +127,8 @@ impl Daemon {
         Ok(())
     }
 
-    #[tracing::instrument(name = "lookup", level = "debug", skip_all,
-                          fields(parent = op.parent(), name = ?op.name()))]
-    async fn do_lookup(&mut self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
+    async fn lookup(&mut self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
         let path = match self.path_table.get(op.parent()) {
             Some(parent) => parent.join(op.name()),
             None => {
@@ -204,16 +202,16 @@ impl Daemon {
         }
     }
 
-    #[tracing::instrument(name = "forget", level = "debug", skip_all)]
-    fn do_forget(&mut self, forgets: &[op::Forget]) {
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn forget(&mut self, forgets: &[op::Forget]) {
         for forget in forgets {
             tracing::debug!(ino = forget.ino(), nlookup = forget.nlookup());
             self.path_table.forget(forget.ino(), forget.nlookup());
         }
     }
 
-    #[tracing::instrument(name = "getattr", level = "debug", skip_all, fields(ino = op.ino()))]
-    async fn do_getattr(&mut self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
+    async fn getattr(&mut self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => {
@@ -251,8 +249,8 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(name = "setattr", level = "debug", skip_all, fields(ino = op.ino()))]
-    async fn do_setattr(&mut self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
+    async fn setattr(&mut self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
         const NO_UID: u32 = unsafe {
             mem::transmute::<i32, u32>(-1)
         };
@@ -314,10 +312,8 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(name = "readlink", level = "debug", skip_all)]
-    async fn do_readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
-        tracing::debug!(ino = op.ino());
-
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
+    async fn readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -332,8 +328,8 @@ impl Daemon {
         req.reply(link)
     }
 
-    #[tracing::instrument(name = "symlink", level = "debug", skip_all)]
-    async fn do_symlink(&mut self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name(), link = ?op.link()))]
+    async fn symlink(&mut self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -378,10 +374,8 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(name = "unlink", level = "debug", skip_all)]
-    async fn do_unlink(&mut self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
-        tracing::debug!(parent = op.parent(), name = ?op.name());
-
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
+    async fn unlink(&mut self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -406,8 +400,8 @@ impl Daemon {
         req.reply(())
     }
 
-    #[tracing::instrument(name = "rename", level = "debug", skip_all)]
-    async fn do_rename(&mut self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), newparent = op.newparent(), name = ?op.name(), newname = ?op.newname()))]
+    async fn rename(&mut self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
         let old_parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
@@ -465,14 +459,12 @@ impl Daemon {
         }
     }
 
-    #[tracing::instrument(name = "opendir", level = "debug", skip_all)]
-    async fn do_opendir(
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
+    async fn opendir(
         &mut self,
         req: &Request,
         op: op::Opendir<'_>
     ) -> io::Result<()> {
-        tracing::debug!(ino = op.ino());
-
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
@@ -565,10 +557,9 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(name = "readdir", level = "debug", skip_all)]
-    fn do_readdir(&mut self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
-        tracing::debug!(ino = op.ino(), fh = op.fh(), offset = op.offset(),
-                        size = op.size());
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
+    fn readdir(&mut self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
+        tracing::debug!(offset = op.offset(), size = op.size());
 
         if op.mode() == op::ReaddirMode::Plus {
             tracing::error!("not supported");
@@ -600,19 +591,16 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(name = "releasedir", level = "debug", skip_all)]
-    fn do_releasedir(&mut self, req: &Request, op: op::Releasedir<'_>) -> io::Result<()> {
-        tracing::debug!(ino = op.ino());
-
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
+    fn releasedir(&mut self, req: &Request, op: op::Releasedir<'_>) -> io::Result<()> {
         let _ = DirHandle::from_fh(op.fh());
+        tracing::debug!("released");
 
         req.reply(())
     }
 
-    #[tracing::instrument(name = "open", level = "debug", skip_all, fields(ino = op.ino()))]
-    fn do_open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
-        tracing::debug!(ino = op.ino());
-
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
+    fn open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -641,13 +629,8 @@ impl Daemon {
         req.reply(out)
     }
 
-    #[tracing::instrument(level = "debug", name = "create", skip_all)]
-    async fn do_create(
-        &mut self,
-        req: &Request,
-        op: op::Create<'_>
-    ) -> io::Result<()> {
-        tracing::debug!(ino = ?op.parent());
+    #[tracing::instrument(level = "debug", name = "create", skip_all, fields(parent = op.parent(), name = ?op.name()))]
+    async fn create(&mut self, req: &Request, op: op::Create<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
@@ -727,10 +710,8 @@ impl Daemon {
         req.reply((entry_out, open_out))
     }
 
-    #[tracing::instrument(
-        name = "read", level = "debug", skip_all,
-        fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
-    async fn do_read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
+    async fn read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
         let handle = match self.ensure_open(op.ino(), op.fh()).await {
             Ok(handle) => handle,
             Err(err) => {
@@ -760,17 +741,13 @@ impl Daemon {
         Ok(())
     }
 
-    #[tracing::instrument(
-        name = "write", level = "debug", skip_all,
-        fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
-    async fn do_write(
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
+    async fn write(
         &mut self,
         req: &Request,
         op: op::Write<'_>,
         data: Bytes,
     ) -> io::Result<()> {
-        tracing::debug!("start");
-
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -792,7 +769,7 @@ impl Daemon {
         let size = op.size();
         let req = req.clone();
         tokio::spawn(async move {
-            tracing::debug_span!("start writing...");
+            tracing::debug!("start writing...");
             let _ = match sftp.write(&handle, offset, data).await {
                 Ok(()) => {
                     tracing::debug!(nwritten = size);
@@ -810,8 +787,8 @@ impl Daemon {
         Ok(())
     }
 
-    #[tracing::instrument(name = "release", level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    fn do_release(&self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
+    fn release(&self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
         let mut handle = match FileHandle::from_fh(op.fh()) {
             Some(handle) => handle,
             None => return req.reply_error(libc::EINVAL),
@@ -820,16 +797,13 @@ impl Daemon {
         if let Some(handle) = handle.handle.take() {
             self.invoke_close(handle);
         }
-
         tracing::debug!("released");
+
         req.reply(())
     }
 
-    #[tracing::instrument(name = "interrupt", level = "debug", skip_all, fields(id = op.unique()))]
-    fn do_interrupt(
-        &mut self,
-        _req: &Request,
-        op: op::Interrupt<'_>
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn interrupt(&mut self, _req: &Request, _op: op::Interrupt<'_>
     ) -> io::Result<()> {
         // Currrently, a request is processed on a single thread.
         // So, stopping the processing of the request is not needed.
@@ -837,13 +811,9 @@ impl Daemon {
         Ok(())
     }
 
-    #[tracing::instrument(name = "ensure_open", level = "debug", skip_all)]
-    async fn ensure_open(
-        &mut self,
-        ino: u64,
-        fh: u64
-    ) -> Result<sftp::FileHandle, i32> {
-        tracing::debug!(ino = ino, fh = fh);
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn ensure_open(&mut self, ino: u64, fh: u64) -> Result<sftp::FileHandle, i32> {
+        tracing::debug!(ino, fh);
 
         let path = match self.path_table.get(ino) {
             Some(path) => path,
@@ -1108,11 +1078,10 @@ impl PathTable {
         }
     }
 
-    #[tracing::instrument(name = "rename", level = "debug", skip_all)]
     fn rename(&mut self, old: &Path, new: &Path) {
-        tracing::debug!(?old, ?new);
         if let Some(ino) = self.path_to_ino.get(new) {
             // TODO: keep inode while someone uses it
+            tracing::debug!(ino, "removed");
             self.inodes.remove(ino);
             self.path_to_ino.remove(new);
         }

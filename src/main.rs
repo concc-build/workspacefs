@@ -3,6 +3,7 @@ mod daemon;
 mod fs;
 mod sftp;
 mod ssh;
+mod logging;
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -14,6 +15,10 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
+    /// Logging in a JSON format.
+    #[structopt(long, possible_values = &["text", "json"], default_value = "text")]
+    log_format: String,
+
     /// Mount point.
     #[structopt(parse(from_os_str))]
     mountpoint: PathBuf,
@@ -21,13 +26,10 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(atty::is(atty::Stream::Stderr))
-        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
-        .init();
-
     let opt = Opt::from_args();
+
+    logging::init(&opt.log_format);
+
     let config = config::load(&opt.mountpoint)?;
 
     let remote = match config.remote {
