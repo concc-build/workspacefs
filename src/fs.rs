@@ -26,8 +26,6 @@ where
     let fuse = AsyncSession::mount(mountpoint.as_ref().to_owned(), {
         let mut kconfig = KernelConfig::default();
         kconfig.mount_option("fsname=sshfs");
-        kconfig.mount_option("default_permissions");
-        kconfig.mount_option("nonempty");
         for mount_option in config.options.iter() {
             kconfig.mount_option(mount_option);
         }
