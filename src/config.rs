@@ -47,9 +47,22 @@ impl FuseConfig {
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CacheConfigSet {
+    #[serde(default)]
+    pub page_cache: KernelCacheConfig,
+    #[serde(default)]
+    pub dentry_cache: KernelCacheConfig,
     pub attr: CacheConfig,
     pub entry: CacheConfig,
     pub negative: CacheConfig,
+}
+
+#[serde_as]
+#[derive(Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelCacheConfig {
+    #[serde(default)]
+    pub excludes: Vec<String>,
 }
 
 #[serde_as]

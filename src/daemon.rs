@@ -61,6 +61,8 @@ pub(crate) struct Daemon {
     attr_cache: HashMap<PathBuf, Arc<sftp::FileAttr>>,
     dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
 
+    page_cache_xglobset: GlobSet,
+    dentry_cache_xglobset: GlobSet,
     negative_xglobset: GlobSet,
 }
 
@@ -70,10 +72,6 @@ impl Daemon {
         remote: sftp::Session,
         receiver: Receiver<Message>,
     ) -> Result<Self> {
-        let mut globset_builder = GlobSetBuilder::new();
-        for glob in config.cache.negative.excludes.iter() {
-            globset_builder.add(Glob::new(glob)?);
-        }
         Ok(Self {
             remote,
             receiver,
@@ -83,7 +81,9 @@ impl Daemon {
             negative_timeout: config.cache.negative.timeout.clone().into(),
             attr_cache: HashMap::new(),
             dirent_cache: HashMap::new(),
-            negative_xglobset: globset_builder.build()?,
+            page_cache_xglobset: Self::make_globset(&config.cache.page_cache.excludes)?,
+            dentry_cache_xglobset: Self::make_globset(&config.cache.dentry_cache.excludes)?,
+            negative_xglobset: Self::make_globset(&config.cache.negative.excludes)?,
         })
     }
 
@@ -473,8 +473,9 @@ impl Daemon {
             let fh = DirHandle::into_fh(handle);
             let mut out = OpenOut::default();
             out.fh(fh);
-            out.direct_io(true);
-            //out.cache_dir(true);
+            if !self.dentry_cache_xglobset.is_match(&path) {
+                out.cache_dir(true);
+            }
             return req.reply(out);
         }
 
@@ -534,15 +535,16 @@ impl Daemon {
         tracing::debug!(num = dst.len());
 
         let entries = Arc::new(dst);
-        self.dirent_cache.insert(path, entries.clone());
+        self.dirent_cache.insert(path.clone(), entries.clone());
 
         let handle = Box::new(DirHandle { entries });
         let fh = DirHandle::into_fh(handle);
 
         let mut out = OpenOut::default();
         out.fh(fh);
-        //out.direct_io(true);
-        out.cache_dir(true);
+        if !self.dentry_cache_xglobset.is_match(&path) {
+            out.cache_dir(true);
+        }
 
         req.reply(out)
     }
@@ -614,7 +616,9 @@ impl Daemon {
 
         let mut out = OpenOut::default();
         out.fh(fh);
-        out.keep_cache(true);
+        if !self.page_cache_xglobset.is_match(&path) {
+            out.keep_cache(true);
+        }
 
         req.reply(out)
     }
@@ -695,7 +699,9 @@ impl Daemon {
 
         let mut open_out = OpenOut::default();
         open_out.fh(fh);
-        open_out.keep_cache(true);
+        if !self.page_cache_xglobset.is_match(&path) {
+            open_out.keep_cache(true);
+        }
 
         req.reply((entry_out, open_out))
     }
@@ -830,6 +836,14 @@ impl Daemon {
         HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(sftp_handle.clone());
 
         Ok(sftp_handle)
+    }
+
+    fn make_globset(globs: &[String]) -> Result<GlobSet> {
+        let mut builder = GlobSetBuilder::new();
+        for glob in globs.iter() {
+            builder.add(Glob::new(glob)?);
+        }
+        Ok(builder.build()?)
     }
 
     fn invoke_close(&self, handle: sftp::FileHandle) {
