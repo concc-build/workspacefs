@@ -12,12 +12,12 @@ use std::task::Poll;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
-use crate::config::MountConfig;
+use crate::config::FuseConfig;
 use crate::daemon::Message;
 
 pub(crate) async fn mount<P>(
     mountpoint: P,
-    config: &MountConfig,
+    config: &FuseConfig,
     sender: Sender<Message>
 ) -> Result<()>
 where
@@ -25,15 +25,13 @@ where
 {
     let fuse = AsyncSession::mount(mountpoint.as_ref().to_owned(), {
         let mut kconfig = KernelConfig::default();
-        kconfig.mount_option("fsname=sshfs");
-        for mount_option in config.options.iter() {
+        for mount_option in config.mount_options.iter() {
             kconfig.mount_option(mount_option);
         }
         if let Some(ref fusermount) = config.fusermount {
             kconfig.fusermount_path(fusermount);
         }
-        // SFTP only supports 1-second time resolution.
-        kconfig.time_gran(1000000000);
+        kconfig.time_gran(config.time_gran);
         kconfig
     })
     .await

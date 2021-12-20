@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         let _ = daemon.run().await;
     });
 
-    fs::mount(&opt.mountpoint, &config.mount, sender).await?;
+    fs::mount(&opt.mountpoint, &config.fuse, sender).await?;
 
     Ok(())
 }

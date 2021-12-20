@@ -20,7 +20,7 @@ pub(crate) fn load<P: AsRef<Path>>(dir: P) -> Result<Config> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
     #[serde(default)]
-    pub mount: MountConfig,
+    pub fuse: FuseConfig,
     pub cache: CacheConfigSet,
     pub remote: RemoteConfig,
 }
@@ -28,11 +28,19 @@ pub(crate) struct Config {
 #[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MountConfig {
+pub(crate) struct FuseConfig {
     #[serde(default)]
-    pub options: Vec<String>,
+    pub mount_options: Vec<String>,
     #[serde(default)]
     pub fusermount: Option<String>,
+    #[serde(default = "FuseConfig::default_time_gran")]
+    pub time_gran: u32,
+}
+
+impl FuseConfig {
+    fn default_time_gran() -> u32 {
+        1
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq)]
