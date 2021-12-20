@@ -48,7 +48,7 @@ impl fmt::Debug for Message {
 }
 
 pub(crate) struct Daemon {
-    sftp: sftp::Session,
+    remote: sftp::Session,
     receiver: Receiver<Message>,
     path_table: PathTable,
 
@@ -67,7 +67,7 @@ pub(crate) struct Daemon {
 impl Daemon {
     pub(crate) fn new(
         config: &Config,
-        sftp: sftp::Session,
+        remote: sftp::Session,
         receiver: Receiver<Message>,
     ) -> Result<Self> {
         let mut globset_builder = GlobSetBuilder::new();
@@ -75,7 +75,7 @@ impl Daemon {
             globset_builder.add(Glob::new(glob)?);
         }
         Ok(Self {
-            sftp,
+            remote,
             receiver,
             path_table: PathTable::new(),
             entry_timeout: config.cache.entry.timeout.clone().into(),
@@ -152,7 +152,7 @@ impl Daemon {
             return req.reply(out);
         }
 
-        match self.sftp.lstat(&path).await {
+        match self.remote.lstat(&path).await {
             Ok(stat) => {
                 tracing::debug!(?path, attr = ?stat, "cache attr");
                 let stat = Arc::new(stat);
@@ -230,7 +230,7 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let stat = match self.sftp.lstat(&path).await {
+        let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => {
                 tracing::error!(?err);
@@ -291,12 +291,12 @@ impl Daemon {
                 }
             })
             .flatten();
-        if let Err(err) = self.sftp.setstat(&path, &stat).await {
+        if let Err(err) = self.remote.setstat(&path, &stat).await {
             tracing::error!(?err);
             return req.reply_error(sftp_error_to_errno(&err));
         }
 
-        let stat = match self.sftp.lstat(&path).await {
+        let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
@@ -320,7 +320,7 @@ impl Daemon {
         };
         tracing::debug!(?path);
 
-        let link = match self.sftp.readlink(&path).await {
+        let link = match self.remote.readlink(&path).await {
             Ok(link) => link,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
@@ -339,7 +339,7 @@ impl Daemon {
         let target_path = op.link();
         tracing::debug!(?link_path, ?target_path);
 
-        match self.sftp.symlink(&link_path, &target_path).await {
+        match self.remote.symlink(&link_path, &target_path).await {
             Ok(()) => {
                 tracing::debug!("created");
             }
@@ -349,7 +349,7 @@ impl Daemon {
             }
         }
 
-        let stat = match self.sftp.lstat(&link_path).await {
+        let stat = match self.remote.lstat(&link_path).await {
             Ok(stat) => stat,
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
@@ -384,7 +384,7 @@ impl Daemon {
         let path = parent_path.join(op.name());
         tracing::debug!(?path);
 
-        match self.sftp.remove(&path).await {
+        match self.remote.remove(&path).await {
             Ok(_) => (),
             Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         }
@@ -423,14 +423,14 @@ impl Daemon {
 
         if op.flags() & libc::RENAME_NOREPLACE == 0 {
             tracing::debug!(?new_path, "Trying to remove it first...");
-            if let Err(_) = self.sftp.remove(&new_path).await {
+            if let Err(_) = self.remote.remove(&new_path).await {
                 tracing::debug!("sftp.remove failed");
                 return req.reply_error(libc::EEXIST)
 
             }
         }
 
-        match self.sftp.rename(&old_path, &new_path).await {
+        match self.remote.rename(&old_path, &new_path).await {
             Ok(()) => {
                 self.path_table.rename(&old_path, &new_path);
                 tracing::debug!(?old_path, "invalidate cache");
@@ -484,7 +484,7 @@ impl Daemon {
             return req.reply(out);
         }
 
-        let handle = match self.sftp.opendir(&path).await {
+        let handle = match self.remote.opendir(&path).await {
             Ok(handle) => handle,
             Err(err) => {
                 tracing::error!(?err);
@@ -494,7 +494,7 @@ impl Daemon {
 
         let mut entries = vec![];
         loop {
-            match self.sftp.readdir(&handle).await {
+            match self.remote.readdir(&handle).await {
                 Ok(mut new_entries) => {
                     entries.append(&mut new_entries);
                 }
@@ -661,7 +661,7 @@ impl Daemon {
         let mut attr = sftp::FileAttr::default();
         attr.permissions = Some(op.mode());
 
-        let handle = match self.sftp.open(&path, open_flags, &attr).await {
+        let handle = match self.remote.open(&path, open_flags, &attr).await {
             Ok(file) => file,
             Err(err) => {
                 tracing::error!(?err);
@@ -669,7 +669,7 @@ impl Daemon {
             }
         };
 
-        let stat = match self.sftp.lstat(&path).await {
+        let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
             Err(err) => {
                 self.invoke_close(handle);
@@ -720,7 +720,7 @@ impl Daemon {
             }
         };
 
-        let sftp = self.sftp.clone();
+        let sftp = self.remote.clone();
         let offset = op.offset();
         let size = op.size();
         let req = req.clone();
@@ -764,7 +764,7 @@ impl Daemon {
             }
         };
 
-        let sftp = self.sftp.clone();
+        let sftp = self.remote.clone();
         let offset = op.offset();
         let size = op.size();
         let req = req.clone();
@@ -832,7 +832,7 @@ impl Daemon {
         }
 
         let attr = Default::default();
-        let sftp_handle = match self.sftp.open(&path, open_flags, &attr).await {
+        let sftp_handle = match self.remote.open(&path, open_flags, &attr).await {
             Ok(file) => file,
             Err(err) => return Err(sftp_error_to_errno(&err)),
         };
@@ -843,7 +843,7 @@ impl Daemon {
     }
 
     fn invoke_close(&self, handle: sftp::FileHandle) {
-        let sftp = self.sftp.clone();
+        let sftp = self.remote.clone();
         tokio::spawn(async move {
             match sftp.close(&handle).await {
                 Ok(_) => tracing::debug!("closed successfully"),
