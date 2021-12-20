@@ -109,9 +109,6 @@ pub enum Error {
     #[error("protocol error")]
     Protocol { msg: Cow<'static, str> },
 
-    #[error("from remote: {}", _0)]
-    Remote(#[source] RemoteError),
-
     #[error("session has already been closed")]
     SessionClosed,
 
@@ -121,24 +118,6 @@ pub enum Error {
         #[source]
         std::string::FromUtf8Error,
     ),
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("from remote server")]
-pub struct RemoteError(RemoteStatus);
-
-impl RemoteError {
-    pub fn code(&self) -> u32 {
-        self.0.code
-    }
-
-    pub fn message(&self) -> &str {
-        &self.0.message
-    }
-
-    pub fn language_tag(&self) -> &str {
-        &self.0.language_tag
-    }
 }
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
@@ -280,8 +259,8 @@ impl Session {
         &self,
         packet_type: u8,
         payload: Vec<Bytes>,
-    ) -> Result<Response, Error> {
-        let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
+    ) -> Result<Response, i32> {
+        let inner = self.inner.upgrade().ok_or(libc::EIO)?;
         inner.send_request(packet_type, payload).await
     }
 
@@ -291,12 +270,12 @@ impl Session {
         filename: P,
         pflags: OpenFlag,
         attrs: &FileAttr,
-    ) -> Result<FileHandle, Error>
+    ) -> Result<FileHandle, i32>
     where
         P: AsRef<Path>,
     {
         let path = self.base_path.join(filename.as_ref());
-        let path = path.to_str().expect("").as_bytes();
+        let path = path.to_str().expect("must be a UTF-8 string").as_bytes();
 
         let len = 8 + path.len() + attrs.count_bytes();
 
@@ -308,15 +287,19 @@ impl Session {
 
         match self.request(SSH_FXP_OPEN, vec![payload.freeze()]).await? {
             Response::Handle(handle) => Ok(handle),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("Incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to close a file corresponding to the specified handle.
-    pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
+    pub async fn close(&self, handle: &FileHandle) -> Result<(), i32> {
         let len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(len);
@@ -324,11 +307,15 @@ impl Session {
         payload.put(&handle.0[..]);
 
         match self.request(SSH_FXP_CLOSE, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, ..} if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("Incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
@@ -340,7 +327,7 @@ impl Session {
         handle: &FileHandle,
         offset: u64,
         len: u32,
-    ) -> Result<(usize, Vec<Vec<u8>>), Error> {
+    ) -> Result<(usize, Vec<Vec<u8>>), i32> {
         let offset = offset as usize;
         let len = len as usize;
 
@@ -362,12 +349,8 @@ impl Session {
                     nread += chunk.len();
                     chunks.push(chunk);
                 }
-                Err(Error::Remote(err)) if err.code() == SSH_FX_EOF => {
-                    break
-                }
-                Err(err) => {
-                    return Err(err);
-                }
+                Err(0) => break,  // EOF
+                Err(err) => return Err(err),
             }
         }
 
@@ -379,7 +362,7 @@ impl Session {
         handle: &FileHandle,
         offset: usize,
         len: usize,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, i32> {
         assert!(offset <= u64::MAX as usize);
         assert!(len <= u32::MAX as usize);
 
@@ -398,10 +381,15 @@ impl Session {
                 tracing::debug!(nread = data.len());
                 Ok(data)
             }
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_EOF => Err(0),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("Incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
@@ -413,7 +401,7 @@ impl Session {
         handle: &FileHandle,
         offset: u64,
         data: Bytes
-    ) -> Result<(), Error> {
+    ) -> Result<(), i32> {
         let size = data.len();
 
         // Write chunks in parallel.
@@ -442,7 +430,7 @@ impl Session {
         handle: &FileHandle,
         offset: u64,
         data: Bytes
-    ) -> Result<(), Error> {
+    ) -> Result<(), i32> {
         tracing::debug!(offset, len = data.len(), "writing a chunk...");
 
         let params_len = 16 + handle.0.len();
@@ -454,20 +442,24 @@ impl Session {
         params.put_u32(data.len() as u32);
 
         match self.request(SSH_FXP_WRITE, vec![params.freeze(), data]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => {
+            Response::Status { code, .. } if code == SSH_FX_OK => {
                 tracing::debug!("written");
                 Ok(())
             }
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
-    pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, Error>
+    pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, i32>
     where
         P: AsRef<Path>,
     {
@@ -486,16 +478,20 @@ impl Session {
                 tracing::debug!("done");
                 Ok(attrs)
             }
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to retrieve attribute values for a named file.
     #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
-    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
+    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, i32> {
         let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -504,15 +500,19 @@ impl Session {
 
         match self.request(SSH_FXP_FSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
-    pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
+    pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -528,16 +528,20 @@ impl Session {
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_SETSTAT, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
-    pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), Error> {
+    pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), i32> {
         let payload_len = 4 + handle.0.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -546,17 +550,21 @@ impl Session {
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_FSETSTAT, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to open a directory for reading.
     #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
-    pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, Error>
+    pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, i32>
     where
         P: AsRef<Path>,
     {
@@ -572,16 +580,20 @@ impl Session {
 
         match self.request(SSH_FXP_OPENDIR, vec![payload.freeze()]).await? {
             Response::Handle(handle) => Ok(handle),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to list files and directories contained in an opened directory.
     #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
-    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
+    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, i32> {
         let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -590,15 +602,20 @@ impl Session {
 
         match self.request(SSH_FXP_READDIR, vec![payload.freeze()]).await? {
             Response::Name(entries) => Ok(entries),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_EOF => Err(0),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.remove", level = "debug", skip_all)]
-    pub async fn remove<P>(&self, path: P) -> Result<(), Error>
+    pub async fn remove<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -613,16 +630,20 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_REMOVE, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
-    pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), Error>
+    pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -638,16 +659,20 @@ impl Session {
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_MKDIR, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
-    pub async fn rmdir<P>(&self, path: P) -> Result<(), Error>
+    pub async fn rmdir<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -662,16 +687,20 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_RMDIR, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
-    pub async fn realpath<P>(&self, path: P) -> Result<String, Error>
+    pub async fn realpath<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -688,16 +717,20 @@ impl Session {
         match self.request(SSH_FXP_REALPATH, vec![payload.freeze()]).await? {
             Response::Name(mut entries) =>
                 Ok(mem::replace(&mut entries[0].filename, "".to_string())),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     /// Request to retrieve attribute values for a named file.
     #[instrument(name = "sftp.stat", level = "debug", skip_all)]
-    pub async fn stat<P>(&self, path: P) -> Result<FileAttr, Error>
+    pub async fn stat<P>(&self, path: P) -> Result<FileAttr, i32>
     where
         P: AsRef<Path>,
     {
@@ -713,15 +746,19 @@ impl Session {
 
         match self.request(SSH_FXP_STAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.rename", level = "debug", skip_all)]
-    pub async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), Error>
+    pub async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -753,16 +790,20 @@ impl Session {
         payload.put(new_path);
 
         match self.request(type_, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
-    pub async fn readlink<P>(&self, path: P) -> Result<String, Error>
+    pub async fn readlink<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -778,15 +819,19 @@ impl Session {
 
         match self.request(SSH_FXP_READLINK, vec![payload.freeze()]).await? {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
-    pub async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), Error>
+    pub async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), i32>
     where
         P: AsRef<Path>,
         Q: AsRef<Path> + fmt::Debug,
@@ -799,7 +844,7 @@ impl Session {
         let payload_len = 8 + path.len() + target_path.len();
 
         let reverse_symlink_arguments = self.inner
-            .upgrade().ok_or(Error::SessionClosed)?.reverse_symlink_arguments;
+            .upgrade().ok_or(libc::EIO)?.reverse_symlink_arguments;
 
         let mut payload = BytesMut::with_capacity(payload_len);
         if reverse_symlink_arguments {
@@ -815,16 +860,20 @@ impl Session {
         }
 
         match self.request(SSH_FXP_SYMLINK, vec![payload.freeze()]).await? {
-            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, .. } if code == SSH_FX_OK => Ok(()),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
     #[instrument(name = "sftp.extended", level = "debug", skip_all)]
-    pub async fn extended<R>(&self, request: &str, data: Bytes) -> Result<Vec<u8>, Error> {
+    pub async fn extended<R>(&self, request: &str, data: Bytes) -> Result<Vec<u8>, i32> {
         let request = request.as_bytes();
 
         let payload_len = 4 + request.len();
@@ -835,10 +884,14 @@ impl Session {
 
         match self.request(SSH_FXP_EXTENDED, vec![payload.freeze(), data]).await? {
             Response::Extended(data) => Ok(data.to_vec()),
-            Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
+            Response::Status { code, msg, .. } => {
+                tracing::debug!(code, ?msg);
+                Err(status_code_to_errno(code))
+            }
+            _ => {
+                tracing::error!("incorrect response type");
+                Err(libc::EIO)
+            }
         }
     }
 
@@ -907,7 +960,7 @@ impl Inner {
         &self,
         packet_type: u8,
         mut payload: Vec<Bytes>,
-    ) -> Result<Response, Error> {
+    ) -> Result<Response, i32> {
         // FIXME: choose appropriate atomic ordering.
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
 
@@ -928,10 +981,11 @@ impl Inner {
         self.pending_requests.insert(id, tx);
 
         self.incoming_requests.send(iovec).map_err(|_| {
-            io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
+            tracing::error!("session is not available");
+            libc::EIO
         })?;
 
-        rx.await.map_err(|_| Error::SessionClosed)
+        rx.await.map_err(|_| libc::EIO)
     }
 
     fn has_extension(&self, extension: &(&str, &str)) -> bool {
@@ -951,7 +1005,7 @@ pub struct Connection {
 #[derive(Debug)]
 enum Response {
     /// The operation is failed.
-    Status(RemoteStatus),
+    Status { code: u32, msg: String, lang: String },
 
     /// An opened file handle.
     Handle(FileHandle),
@@ -970,13 +1024,6 @@ enum Response {
 
     /// The response type is unknown or currently not supported.
     Unknown { typ: u8, data: Vec<u8> },
-}
-
-#[derive(Debug)]
-struct RemoteStatus {
-    code: u32,
-    message: String,
-    language_tag: String,
 }
 
 /// Start a SFTP session on the provided transport I/O.
@@ -1167,14 +1214,10 @@ async fn recv_loop(
         let response = match type_ {
             SSH_FXP_STATUS => {
                 let code = packet.read_u32().await?;
-                let message = packet.read_string().await?;
-                let language_tag = packet.read_string().await?;
-                tracing::trace!(id, r#type = "STATUS", code, ?message, ?language_tag);
-                Response::Status(RemoteStatus {
-                    code,
-                    message,
-                    language_tag,
-                })
+                let msg = packet.read_string().await?;
+                let lang = packet.read_string().await?;
+                tracing::trace!(id, r#type = "STATUS", code, ?msg, ?lang);
+                Response::Status { code, msg, lang }
             }
             SSH_FXP_HANDLE => {
                 let handle = packet.read_bytes().await?;
@@ -1373,4 +1416,14 @@ where
 fn put_string(b: &mut BytesMut, s: &[u8]) {
     b.put_u32(s.len() as u32);
     b.put(s);
+}
+
+fn status_code_to_errno(code: u32) -> i32 {
+    match code {
+        SSH_FX_OK => 0,
+        SSH_FX_NO_SUCH_FILE => libc::ENOENT,
+        SSH_FX_PERMISSION_DENIED => libc::EPERM,
+        SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
+        _ => libc::EIO,
+    }
 }

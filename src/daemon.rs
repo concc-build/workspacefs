@@ -170,21 +170,16 @@ impl Daemon {
 
                 req.reply(out)
             }
-            Err(err) => {
-                let errno = sftp_error_to_errno(&err);
-                match errno {
-                    libc::ENOENT if self.can_cache_negative_lookup(&path) => {
-                        tracing::debug!("cache negative lookup");
-                        // negative cache
-                        let mut out = EntryOut::default();
-                        out.ttl_entry(self.negative_timeout);
-                        req.reply(out)
-                    }
-                    err => {
-                        tracing::warn!(?err);
-                        req.reply_error(err)
-                    }
-                }
+            Err(libc::ENOENT) if self.can_cache_negative_lookup(&path) => {
+                tracing::debug!("cache negative lookup");
+                // negative cache
+                let mut out = EntryOut::default();
+                out.ttl_entry(self.negative_timeout);
+                req.reply(out)
+            }
+            Err(errno) => {
+                tracing::warn!(?errno);
+                req.reply_error(errno)
             }
         }
     }
@@ -232,9 +227,9 @@ impl Daemon {
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(err) => {
-                tracing::error!(?err);
-                return req.reply_error(sftp_error_to_errno(&err));
+            Err(errno) => {
+                tracing::error!(?errno);
+                return req.reply_error(errno);
             }
         };
 
@@ -291,14 +286,14 @@ impl Daemon {
                 }
             })
             .flatten();
-        if let Err(err) = self.remote.setstat(&path, &stat).await {
-            tracing::error!(?err);
-            return req.reply_error(sftp_error_to_errno(&err));
+        if let Err(errno) = self.remote.setstat(&path, &stat).await {
+            tracing::error!(?errno);
+            return req.reply_error(errno);
         }
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+            Err(errno) => return req.reply_error(errno),
         };
 
         tracing::debug!(?path, attr = ?stat, "cache attr");
@@ -322,7 +317,7 @@ impl Daemon {
 
         let link = match self.remote.readlink(&path).await {
             Ok(link) => link,
-            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+            Err(errno) => return req.reply_error(errno),
         };
 
         req.reply(link)
@@ -343,15 +338,15 @@ impl Daemon {
             Ok(()) => {
                 tracing::debug!("created");
             }
-            Err(err) => {
-                tracing::error!(?err, "sftp::symlink failed");
-                return req.reply_error(sftp_error_to_errno(&err));
+            Err(errno) => {
+                tracing::error!(?errno);
+                return req.reply_error(errno);
             }
         }
 
         let stat = match self.remote.lstat(&link_path).await {
             Ok(stat) => stat,
-            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+            Err(errno) => return req.reply_error(errno),
         };
 
         tracing::debug!(?link_path, attr = ?stat, "cache attr");
@@ -384,9 +379,8 @@ impl Daemon {
         let path = parent_path.join(op.name());
         tracing::debug!(?path);
 
-        match self.remote.remove(&path).await {
-            Ok(_) => (),
-            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+        if let Err(errno) = self.remote.remove(&path).await {
+            return req.reply_error(errno);
         }
 
         tracing::debug!(?path, "invalidate cache");
@@ -452,9 +446,9 @@ impl Daemon {
                 tracing::debug!("done");
                 req.reply(())
             }
-            Err(err) => {
-                tracing::error!(?err);
-                req.reply_error(sftp_error_to_errno(&err))
+            Err(errno) => {
+                tracing::error!(?errno);
+                req.reply_error(errno)
             }
         }
     }
@@ -486,24 +480,20 @@ impl Daemon {
 
         let handle = match self.remote.opendir(&path).await {
             Ok(handle) => handle,
-            Err(err) => {
-                tracing::error!(?err);
-                return req.reply_error(sftp_error_to_errno(&err))
+            Err(errno) => {
+                tracing::error!(?errno);
+                return req.reply_error(errno)
             }
         };
 
         let mut entries = vec![];
         loop {
             match self.remote.readdir(&handle).await {
-                Ok(mut new_entries) => {
-                    entries.append(&mut new_entries);
-                }
-                Err(sftp::Error::Remote(err)) if err.code() == sftp::SSH_FX_EOF => {
-                    break;
-                }
-                Err(err) => {
-                    tracing::error!(?err);
-                    return req.reply_error(sftp_error_to_errno(&err))
+                Ok(mut new_entries) => entries.append(&mut new_entries),
+                Err(0) => break,
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    return req.reply_error(errno)
                 }
             }
         }
@@ -663,18 +653,18 @@ impl Daemon {
 
         let handle = match self.remote.open(&path, open_flags, &attr).await {
             Ok(file) => file,
-            Err(err) => {
-                tracing::error!(?err);
-                return req.reply_error(sftp_error_to_errno(&err));
+            Err(errno) => {
+                tracing::error!(?errno);
+                return req.reply_error(errno);
             }
         };
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(err) => {
+            Err(errno) => {
                 self.invoke_close(handle);
-                tracing::error!(?err);
-                return req.reply_error(sftp_error_to_errno(&err));
+                tracing::error!(?errno);
+                return req.reply_error(errno);
             }
         };
 
@@ -731,9 +721,9 @@ impl Daemon {
                     tracing::debug!(nread);
                     req.reply(chunks)
                 }
-                Err(err) => {
-                    tracing::error!(?err);
-                    req.reply_error(sftp_error_to_errno(&err))
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    req.reply_error(errno)
                 }
             };
         }.instrument(tracing::debug_span!("task")));
@@ -777,9 +767,9 @@ impl Daemon {
                     out.size(size);
                     req.reply(out)
                 }
-                Err(err) => {
-                    tracing::error!(?err);
-                    req.reply_error(sftp_error_to_errno(&err))
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    req.reply_error(errno)
                 }
             };
         }.instrument(tracing::debug_span!("task")));
@@ -834,7 +824,7 @@ impl Daemon {
         let attr = Default::default();
         let sftp_handle = match self.remote.open(&path, open_flags, &attr).await {
             Ok(file) => file,
-            Err(err) => return Err(sftp_error_to_errno(&err)),
+            Err(errno) => return Err(errno),
         };
 
         HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(sftp_handle.clone());
@@ -953,19 +943,6 @@ fn fill_attr(attr: &mut FileAttr, st: &sftp::FileAttr) {
         let blocks = ((size + BSIZE - 1) & !(BSIZE - 1)) >> 9;
         attr.blksize(BSIZE as u32);
         attr.blocks(blocks);
-    }
-}
-
-fn sftp_error_to_errno(err: &sftp::Error) -> i32 {
-    match err {
-        sftp::Error::Remote(err) => match err.code() {
-            sftp::SSH_FX_OK => 0,
-            sftp::SSH_FX_NO_SUCH_FILE => libc::ENOENT,
-            sftp::SSH_FX_PERMISSION_DENIED => libc::EPERM,
-            sftp::SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
-            _ => libc::EIO,
-        },
-        _ => libc::EIO,
     }
 }
 
