@@ -32,7 +32,16 @@ pub(crate) fn init(
     sftp: sftp::Session,
 ) -> Result<(Sender<Message>, Daemon)> {
     let (sender, receiver) = mpsc::channel(100);
-    Ok((sender, Daemon::new(config, sftp, receiver)?))
+    let mut daemon = Daemon::new(config, sftp, receiver)?;
+    daemon.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(sftp::FileAttr {
+        size: Some(0),
+        uid_gid: Some((0, 0)),
+        permissions: Some(libc::S_IFDIR | 0o0755),
+        ac_mod_time: Some((0, 0)),
+        extended: vec![],
+    }));
+    daemon.dirent_cache.insert(PathBuf::from(".netfs.d"), Arc::new(vec![]));
+    Ok((sender, daemon))
 }
 
 pub(crate) enum Message {
@@ -502,6 +511,13 @@ impl Daemon {
         self.invoke_close(handle);
 
         let mut dst = vec![];
+        if op.ino() == ROOT_INO {
+            dst.push(DirEntry {
+                name: ".netfs.d".to_string(),
+                ino: NO_INO,
+                typ: libc::S_IFDIR,
+            });
+        }
         for entry in entries.into_iter() {
             if entry.filename == "." || entry.filename == ".." {
                 continue;
@@ -980,13 +996,14 @@ struct INode {
     path: PathBuf,
 }
 
+const ROOT_INO: u64 = 1;
 const NO_INO: u64 = 0xFFFFFFFF;
 
 impl PathTable {
     fn new() -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
-            1,
+            ROOT_INO,
             INode {
                 refcount: u64::MAX / 2,
                 ino: 1,
@@ -996,7 +1013,7 @@ impl PathTable {
         );
 
         let mut path_to_ino = HashMap::new();
-        path_to_ino.insert(PathBuf::new(), 1);
+        path_to_ino.insert(PathBuf::new(), ROOT_INO);
 
         Self {
             inodes,
