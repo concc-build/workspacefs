@@ -608,6 +608,7 @@ impl Daemon {
 
         // TODO: Keep inode until the handle is released.
         let handle = Box::new(FileHandle {
+            path: path.to_owned(),
             open_flags,
             handle: None,
         });
@@ -683,6 +684,7 @@ impl Daemon {
         let inode = self.path_table.recognize(&path);
 
         let handle = Box::new(FileHandle {
+            path: path.clone(),
             open_flags,
             handle: Some(handle),
         });
@@ -708,21 +710,22 @@ impl Daemon {
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
     async fn read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
-        let handle = match self.ensure_open(op.ino(), op.fh()).await {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::error!(?err);
-                return req.reply_error(err);
-            }
-        };
-
-        let sftp = self.remote.clone();
+        let remote = self.remote.clone();
+        let fh = op.fh();
         let offset = op.offset();
         let size = op.size();
         let req = req.clone();
         tokio::spawn(async move {
+            let handle = match Self::ensure_open(fh, &remote).await {
+                Ok(handle) => handle,
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    let _ = req.reply_error(errno);
+                    return;
+                }
+            };
             tracing::debug!("start reading...");
-            let _ = match sftp.read(&handle, offset, size).await {
+            let _ = match remote.read(&handle, offset, size).await {
                 Ok((nread, chunks)) => {
                     tracing::debug!(nread);
                     req.reply(chunks)
@@ -748,25 +751,25 @@ impl Daemon {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
-
         tracing::debug!(?path, "invalidate cache");
         self.attr_cache.remove(path);
 
-        let handle = match self.ensure_open(op.ino(), op.fh()).await {
-            Ok(handle) => handle,
-            Err(err) => {
-                tracing::error!(?err);
-                return req.reply_error(err);
-            }
-        };
-
-        let sftp = self.remote.clone();
+        let remote = self.remote.clone();
+        let fh = op.fh();
         let offset = op.offset();
         let size = op.size();
         let req = req.clone();
         tokio::spawn(async move {
+            let handle = match Self::ensure_open(fh, &remote).await {
+                Ok(handle) => handle,
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    let _ = req.reply_error(errno);
+                    return;
+                }
+            };
             tracing::debug!("start writing...");
-            let _ = match sftp.write(&handle, offset, data).await {
+            let _ = match remote.write(&handle, offset, data).await {
                 Ok(()) => {
                     tracing::debug!(nwritten = size);
                     let mut out = WriteOut::default();
@@ -785,6 +788,7 @@ impl Daemon {
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
     fn release(&self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
+        // Assumed that all operations using the file handle have been finished.
         let mut handle = match FileHandle::from_fh(op.fh()) {
             Some(handle) => handle,
             None => return req.reply_error(libc::EINVAL),
@@ -808,34 +812,34 @@ impl Daemon {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn ensure_open(&mut self, ino: u64, fh: u64) -> Result<sftp::FileHandle, i32> {
-        tracing::debug!(ino, fh);
-
-        let path = match self.path_table.get(ino) {
-            Some(path) => path,
-            None => return Err(libc::EINVAL),
-        };
-        tracing::debug!(?path);
-
-        let (open_flags, sftp_handle) = match HandleRef::<FileHandle>::from_fh(fh) {
-            Some(handle_ref) => (handle_ref.open_flags, handle_ref.handle.clone()),
+    async fn ensure_open(
+        fh: u64,
+        remote: &sftp::Session,
+    ) -> Result<sftp::FileHandle, i32> {
+        let remote_handle = match HandleRef::<FileHandle>::from_fh(fh) {
+            Some(handle_ref) => handle_ref.handle.clone(),
             None => return Err(libc::EINVAL),
         };
 
-        if let Some(sftp_handle) = sftp_handle {
+        if let Some(remote_handle) = remote_handle {
             tracing::debug!("already opened");
-            return Ok(sftp_handle);
+            return Ok(remote_handle);
         }
 
+        let (path, open_flags) = match HandleRef::<FileHandle>::from_fh(fh) {
+            Some(handle_ref) => (handle_ref.path.clone(), handle_ref.open_flags),
+            None => return Err(libc::EINVAL),
+        };
+
         let attr = Default::default();
-        let sftp_handle = match self.remote.open(&path, open_flags, &attr).await {
-            Ok(file) => file,
+        let remote_handle = match remote.open(&path, open_flags, &attr).await {
+            Ok(handle) => handle,
             Err(errno) => return Err(errno),
         };
 
-        HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(sftp_handle.clone());
+        HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(remote_handle.clone());
 
-        Ok(sftp_handle)
+        Ok(remote_handle)
     }
 
     fn make_globset(globs: &[String]) -> Result<GlobSet> {
@@ -880,6 +884,7 @@ impl DirHandle {
 }
 
 struct FileHandle {
+    path: PathBuf,
     open_flags: sftp::OpenFlag,
     handle: Option<sftp::FileHandle>,
 }
