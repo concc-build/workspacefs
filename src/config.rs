@@ -48,6 +48,8 @@ impl FuseConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CacheConfigSet {
     #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
     pub page_cache: KernelCacheConfig,
     #[serde(default)]
     pub dentry_cache: KernelCacheConfig,

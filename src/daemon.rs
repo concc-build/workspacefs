@@ -90,9 +90,12 @@ impl Daemon {
             negative_timeout: config.cache.negative.timeout.clone().into(),
             attr_cache: HashMap::new(),
             dirent_cache: HashMap::new(),
-            page_cache_xglobset: Self::make_globset(&config.cache.page_cache.excludes)?,
-            dentry_cache_xglobset: Self::make_globset(&config.cache.dentry_cache.excludes)?,
-            negative_xglobset: Self::make_globset(&config.cache.negative.excludes)?,
+            page_cache_xglobset: Self::make_globset(
+                &config.cache.page_cache.excludes, &config.cache.excludes)?,
+            dentry_cache_xglobset: Self::make_globset(
+                &config.cache.dentry_cache.excludes, &config.cache.excludes)?,
+            negative_xglobset: Self::make_globset(
+                &config.cache.negative.excludes, &config.cache.excludes)?,
         })
     }
 
@@ -858,8 +861,11 @@ impl Daemon {
         Ok(remote_handle)
     }
 
-    fn make_globset(globs: &[String]) -> Result<GlobSet> {
+    fn make_globset(globs: &[String], global_globs: &[String]) -> Result<GlobSet> {
         let mut builder = GlobSetBuilder::new();
+        for glob in global_globs.iter() {
+            builder.add(Glob::new(glob)?);
+        }
         for glob in globs.iter() {
             builder.add(Glob::new(glob)?);
         }
