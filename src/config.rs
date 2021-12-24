@@ -21,6 +21,10 @@ pub(crate) fn load<P: AsRef<Path>>(dir: P) -> Result<Config> {
 pub(crate) struct Config {
     #[serde(default)]
     pub fuse: FuseConfig,
+    #[serde(default)]
+    pub uid_map: Vec<IdMap>,
+    #[serde(default)]
+    pub gid_map: Vec<IdMap>,
     pub cache: CacheConfigSet,
     pub remote: RemoteConfig,
 }
@@ -41,6 +45,14 @@ impl FuseConfig {
     fn default_time_gran() -> u32 {
         1
     }
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdMap {
+    pub local: u32,
+    pub remote: u32,
 }
 
 #[derive(Clone, Deserialize, PartialEq)]

@@ -25,6 +25,7 @@ use tokio::sync::mpsc::Sender;
 use tracing;
 use tracing::Instrument;
 use crate::config::Config;
+use crate::config::IdMap;
 use crate::sftp;
 
 pub(crate) fn init(
@@ -61,6 +62,12 @@ pub(crate) struct Daemon {
     receiver: Receiver<Message>,
     path_table: PathTable,
 
+    // id maps: remote -> local
+    uid_map: HashMap<u32, u32>,
+    uid_rmap: HashMap<u32, u32>,
+    gid_map: HashMap<u32, u32>,
+    gid_rmap: HashMap<u32, u32>,
+
     // timeout values for caching
     entry_timeout: Duration,
     attr_timeout: Duration,
@@ -85,6 +92,10 @@ impl Daemon {
             remote,
             receiver,
             path_table: PathTable::new(),
+            uid_map: Self::make_map(&config.uid_map),
+            uid_rmap: Self::make_rmap(&config.uid_map),
+            gid_map: Self::make_map(&config.gid_map),
+            gid_rmap: Self::make_rmap(&config.gid_map),
             entry_timeout: config.cache.entry.timeout.clone().into(),
             attr_timeout: config.cache.attr.timeout.clone().into(),
             negative_timeout: config.cache.negative.timeout.clone().into(),
@@ -153,14 +164,16 @@ impl Daemon {
         if let Some(stat) = self.attr_cache.get(&path) {
             tracing::debug!("hit cache");
             let inode = self.path_table.recognize(&path);
+            let ino = inode.ino;
+            let generation = inode.generation;
 
             let mut out = EntryOut::default();
-            fill_attr(out.attr(), &stat);
+            self.fill_attr(out.attr(), &stat);
             out.ttl_attr(self.attr_timeout);
             out.ttl_entry(self.entry_timeout);
-            out.ino(inode.ino);
-            out.generation(inode.generation);
-            out.attr().ino(inode.ino);
+            out.ino(ino);
+            out.generation(generation);
+            out.attr().ino(ino);
             return req.reply(out);
         }
 
@@ -171,14 +184,16 @@ impl Daemon {
                 self.attr_cache.insert(path.clone(), stat.clone());
 
                 let inode = self.path_table.recognize(&path);
+                let ino = inode.ino;
+                let generation = inode.generation;
 
                 let mut out = EntryOut::default();
-                fill_attr(out.attr(), &stat);
+                self.fill_attr(out.attr(), &stat);
                 out.ttl_attr(self.attr_timeout);
                 out.ttl_entry(self.entry_timeout);
-                out.ino(inode.ino);
-                out.generation(inode.generation);
-                out.attr().ino(inode.ino);
+                out.ino(ino);
+                out.generation(generation);
+                out.attr().ino(ino);
 
                 req.reply(out)
             }
@@ -231,7 +246,7 @@ impl Daemon {
         if let Some(stat) = self.attr_cache.get(path) {
             tracing::debug!("hit cache");
             let mut out = AttrOut::default();
-            fill_attr(out.attr(), &stat);
+            self.fill_attr(out.attr(), &stat);
             out.attr().ino(op.ino());
             out.ttl(Duration::from_secs(60));
             return req.reply(out);
@@ -250,7 +265,7 @@ impl Daemon {
         self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
-        fill_attr(out.attr(), &stat);
+        self.fill_attr(out.attr(), &stat);
         out.attr().ino(op.ino());
         out.ttl(Duration::from_secs(60));
         req.reply(out)
@@ -273,7 +288,9 @@ impl Daemon {
 
         let mut stat = sftp::FileAttr::default();
         stat.size = op.size();
-        stat.uid_gid = match (op.uid(), op.gid()) {
+        let uid = op.uid().map(|uid| self.rmap_uid(uid));
+        let gid = op.gid().map(|gid| self.rmap_gid(gid));
+        stat.uid_gid = match (uid, gid) {
             (Some(uid), Some(gid)) => Some((uid, gid)),
             (Some(uid), None) => Some((uid, NO_GID)),
             (None, Some(gid)) => Some((NO_UID, gid)),
@@ -313,7 +330,7 @@ impl Daemon {
         self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
-        fill_attr(out.attr(), &stat);
+        self.fill_attr(out.attr(), &stat);
         out.attr().ino(op.ino());
         out.ttl(Duration::from_secs(60));
         req.reply(out)
@@ -370,14 +387,16 @@ impl Daemon {
         self.dirent_cache.remove(parent_path);
 
         let inode = self.path_table.recognize(&link_path);
+        let ino = inode.ino;
+        let generation = inode.generation;
 
         let mut out = EntryOut::default();
-        fill_attr(out.attr(), &stat);
+        self.fill_attr(out.attr(), &stat);
         out.ttl_attr(self.attr_timeout);
         out.ttl_entry(self.entry_timeout);
-        out.ino(inode.ino);
-        out.generation(inode.generation);
-        out.attr().ino(inode.ino);
+        out.ino(ino);
+        out.generation(generation);
+        out.attr().ino(ino);
         req.reply(out)
     }
 
@@ -701,6 +720,8 @@ impl Daemon {
         self.dirent_cache.remove(&parent_path);
 
         let inode = self.path_table.recognize(&path);
+        let ino = inode.ino;
+        let generation = inode.generation;
 
         let handle = Box::new(FileHandle {
             path: path.clone(),
@@ -711,12 +732,12 @@ impl Daemon {
         tracing::debug!(?fh);
 
         let mut entry_out = EntryOut::default();
-        fill_attr(entry_out.attr(), &stat);
+        self.fill_attr(entry_out.attr(), &stat);
         entry_out.ttl_attr(self.entry_timeout);
         entry_out.ttl_entry(self.attr_timeout);
-        entry_out.ino(inode.ino);
-        entry_out.generation(inode.generation);
-        entry_out.attr().ino(inode.ino);
+        entry_out.ino(ino);
+        entry_out.generation(generation);
+        entry_out.attr().ino(ino);
 
         let mut open_out = OpenOut::default();
         open_out.fh(fh);
@@ -830,6 +851,46 @@ impl Daemon {
         Ok(())
     }
 
+    fn map_uid(&self, uid: u32) -> u32 {
+        self.uid_map.get(&uid).cloned().unwrap_or(uid)
+    }
+
+    fn rmap_uid(&self, uid: u32) -> u32 {
+        self.uid_rmap.get(&uid).cloned().unwrap_or(uid)
+    }
+
+    fn map_gid(&self, gid: u32) -> u32 {
+        self.gid_map.get(&gid).cloned().unwrap_or(gid)
+    }
+
+    fn rmap_gid(&self, gid: u32) -> u32 {
+        self.gid_rmap.get(&gid).cloned().unwrap_or(gid)
+    }
+
+    fn fill_attr(&self, attr: &mut FileAttr, st: &sftp::FileAttr) {
+        let size = st.size.unwrap_or(0);
+        let uid = st.uid().map(|uid| self.map_uid(uid)).unwrap_or(0);
+        let gid = st.gid().map(|gid| self.map_gid(gid)).unwrap_or(0);
+        let mtime = Duration::from_secs(st.mtime().unwrap_or(0).into());
+
+        attr.size(size);
+        attr.mode(st.permissions.unwrap_or(0));
+        attr.uid(uid);
+        attr.gid(gid);
+        attr.atime(Duration::from_secs(st.atime().unwrap_or(0).into()));
+        attr.mtime(mtime);
+        attr.ctime(mtime);
+
+        attr.nlink(1);
+
+        if cfg!(target_os = "linux") {
+            const BSIZE: u64 = 4096;
+            let blocks = ((size + BSIZE - 1) & !(BSIZE - 1)) >> 9;
+            attr.blksize(BSIZE as u32);
+            attr.blocks(blocks);
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip_all)]
     async fn ensure_open(
         fh: u64,
@@ -859,6 +920,22 @@ impl Daemon {
         HandleRef::<FileHandle>::from_fh(fh).unwrap().handle = Some(remote_handle.clone());
 
         Ok(remote_handle)
+    }
+
+    fn make_map(idmap: &[IdMap]) -> HashMap<u32, u32> {
+        let mut map = HashMap::new();
+        for id in idmap.iter() {
+            map.insert(id.remote, id.local);
+        }
+        map
+    }
+
+    fn make_rmap(idmap: &[IdMap]) -> HashMap<u32, u32> {
+        let mut map = HashMap::new();
+        for id in idmap.iter() {
+            map.insert(id.local, id.remote);
+        }
+        map
     }
 
     fn make_globset(globs: &[String], global_globs: &[String]) -> Result<GlobSet> {
@@ -963,28 +1040,6 @@ struct DirEntry {
     name: String,
     typ: u32,
     ino: u64,
-}
-
-fn fill_attr(attr: &mut FileAttr, st: &sftp::FileAttr) {
-    let size = st.size.unwrap_or(0);
-    let mtime = Duration::from_secs(st.mtime().unwrap_or(0).into());
-
-    attr.size(size);
-    attr.mode(st.permissions.unwrap_or(0));
-    attr.uid(st.uid().unwrap_or(0));
-    attr.gid(st.gid().unwrap_or(0));
-    attr.atime(Duration::from_secs(st.atime().unwrap_or(0).into()));
-    attr.mtime(mtime);
-    attr.ctime(mtime);
-
-    attr.nlink(1);
-
-    if cfg!(target_os = "linux") {
-        const BSIZE: u64 = 4096;
-        let blocks = ((size + BSIZE - 1) & !(BSIZE - 1)) >> 9;
-        attr.blksize(BSIZE as u32);
-        attr.blocks(blocks);
-    }
 }
 
 /// Data structure that holds the correspondence between inode number and path.
