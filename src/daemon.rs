@@ -26,7 +26,10 @@ use tracing;
 use tracing::Instrument;
 use crate::config::Config;
 use crate::config::IdMap;
+use crate::remote;
 use crate::sftp;
+
+const BSIZE: u64 = if cfg!(target_os = "macos") { 0 } else { 4096 };
 
 pub(crate) fn init(
     config: &Config,
@@ -139,8 +142,8 @@ impl Daemon {
             Operation::Read(op) => self.read(&req, op).await?,
             Operation::Write(op, data) => self.write(&req, op, data).await?,
             Operation::Release(op) => self.release(&req, op)?,
+            Operation::Statfs(op) => self.statfs(&req, op)?,
             Operation::Interrupt(op) => self.interrupt(&req,op)?,
-
             op @ _ => {
                 tracing::trace!(?op);
                 req.reply_error(libc::ENOSYS)?
@@ -842,6 +845,34 @@ impl Daemon {
         req.reply(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
+    fn statfs(&self, req: &Request, op: op::Statfs<'_>) -> io::Result<()> {
+        let path = match self.path_table.get(op.ino()) {
+            Some(path) => path.to_owned(),
+            None => return req.reply_error(libc::EINVAL),
+        };
+        tracing::debug!(?path);
+
+        let remote = self.remote.clone();
+        let req = req.clone();
+        tokio::spawn(async move {
+            let _ = match remote.statfs(&path).await {
+                Ok(statfs) => {
+                    tracing::debug!(?statfs);
+                    let mut out = StatfsOut::default();
+                    Self::fill_statfs(&statfs, out.statfs());
+                    req.reply(out)
+                }
+                Err(errno) => {
+                    tracing::error!(?errno);
+                    req.reply_error(errno)
+                }
+            };
+        }.instrument(tracing::debug_span!("task")));
+
+        Ok(())
+    }
+
     #[tracing::instrument(level = "debug", skip_all)]
     fn interrupt(&mut self, _req: &Request, _op: op::Interrupt<'_>
     ) -> io::Result<()> {
@@ -884,11 +915,21 @@ impl Daemon {
         attr.nlink(1);
 
         if cfg!(target_os = "linux") {
-            const BSIZE: u64 = 4096;
             let blocks = ((size + BSIZE - 1) & !(BSIZE - 1)) >> 9;
             attr.blksize(BSIZE as u32);
             attr.blocks(blocks);
         }
+    }
+
+    fn fill_statfs(src: &remote::Statfs, dest: &mut Statfs) {
+        dest.bsize(src.bsize);
+        dest.frsize(src.frsize);
+        dest.blocks(src.blocks);
+        dest.bfree(src.bfree);
+        dest.bavail(src.bavail);
+        dest.files(src.files);
+        dest.ffree(src.ffree);
+        dest.namelen(src.namelen);
     }
 
     #[tracing::instrument(level = "debug", skip_all)]

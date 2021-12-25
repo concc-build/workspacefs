@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod fs;
+mod remote;
 mod sftp;
 mod ssh;
 mod logging;

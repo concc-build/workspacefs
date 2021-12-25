@@ -34,6 +34,7 @@ use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::task::JoinHandle;
 use tracing::instrument;
+use crate::remote::*;
 use crate::ssh;
 use crate::config::SftpConfig;
 
@@ -870,6 +871,28 @@ impl Session {
                 Err(libc::EIO)
             }
         }
+    }
+
+    #[instrument(name = "sftp.statfs", level = "debug", skip_all, fields(?path))]
+    pub(crate) async fn statfs<P>(&self, path: P) -> Result<Statfs, i32>
+    where
+        P: AsRef<Path> + fmt::Debug,
+    {
+        // The following implementation is based on libfuse/ssfhs.
+        const BSIZE: u32 = if cfg!(target_os = "macos") { 0 } else { 4096 };
+        const BLOCKS: u64 = 1000u64 * 1024 * 1024 * 1024 / (BSIZE as u64);
+        const FILES: u64 = 1000000000;
+        const NAMEMAX: u32 = 255;
+        Ok(Statfs {
+            bsize: BSIZE,
+            blocks: BLOCKS,
+            bfree: BLOCKS,
+            bavail: BLOCKS,
+            files: FILES,
+            ffree: FILES,
+            namelen: NAMEMAX,
+            frsize: BSIZE,
+        })
     }
 
     #[instrument(name = "sftp.extended", level = "debug", skip_all)]
