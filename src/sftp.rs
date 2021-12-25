@@ -644,13 +644,16 @@ impl Session {
     }
 
     #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
-    pub async fn mkdir<P>(&self, path: P, attrs: &FileAttr) -> Result<(), i32>
+    pub async fn mkdir<P>(&self, path: P, mode: u32) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
         let path = self.base_path.join(path.as_ref());
         tracing::debug!(?path);
         let path = path.to_str().expect("must be a valid Unicode").as_bytes();
+
+        let mut attrs = FileAttr::default();
+        attrs.permissions = Some(mode);
 
         let payload_len = 4 + path.len() + attrs.count_bytes();
 

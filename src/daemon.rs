@@ -132,7 +132,9 @@ impl Daemon {
             Operation::Setattr(op) => self.setattr(&req, op).await?,
             Operation::Readlink(op) => self.readlink(&req, op).await?,
             Operation::Symlink(op) => self.symlink(&req, op).await?,
+            Operation::Mkdir(op) => self.mkdir(&req, op).await?,
             Operation::Unlink(op) => self.unlink(&req, op).await?,
+            Operation::Rmdir(op) => self.rmdir(&req, op).await?,
             Operation::Rename(op) => self.rename(&req, op).await?,
             Operation::Opendir(op) => self.opendir(&req, op).await?,
             Operation::Readdir(op) => self.readdir(&req, op)?,
@@ -404,6 +406,51 @@ impl Daemon {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
+    async fn mkdir(&mut self, req: &Request, op: op::Mkdir<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.get(op.parent()) {
+            Some(path) => path.to_owned(),
+            None => return req.reply_error(libc::EINVAL),
+        };
+        let path = parent_path.join(op.name());
+        tracing::debug!(?path, mode = op.mode());
+
+        if let Err(errno) = self.remote.mkdir(&path, op.mode()).await {
+            tracing::error!(?errno);
+            return req.reply_error(errno);
+        }
+
+        let stat = match self.remote.lstat(&path).await {
+            Ok(stat) => stat,
+            Err(errno) => {
+                tracing::error!(?errno);
+                return req.reply_error(errno);
+            }
+        };
+
+        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let stat = Arc::new(stat);
+        self.attr_cache.insert(path.clone(), stat.clone());
+
+        tracing::debug!(?parent_path, "invalidate cache");
+        self.attr_cache.remove(&parent_path);
+        self.dirent_cache.remove(&parent_path);
+
+        let inode = self.path_table.recognize(&path);
+        let ino = inode.ino;
+        let generation = inode.generation;
+
+        let mut entry_out = EntryOut::default();
+        self.fill_attr(entry_out.attr(), &stat);
+        entry_out.ttl_attr(self.entry_timeout);
+        entry_out.ttl_entry(self.attr_timeout);
+        entry_out.ino(ino);
+        entry_out.generation(generation);
+        entry_out.attr().ino(ino);
+
+        req.reply(entry_out)
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
     async fn unlink(&mut self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.get(op.parent()) {
             Some(path) => path,
@@ -413,19 +460,48 @@ impl Daemon {
         let path = parent_path.join(op.name());
         tracing::debug!(?path);
 
-        if let Err(errno) = self.remote.remove(&path).await {
-            return req.reply_error(errno);
+        match self.remote.remove(&path).await {
+            Ok(_) => {
+                tracing::debug!(?path, "invalidate cache");
+                self.attr_cache.remove(&path);
+                self.dirent_cache.remove(&path);
+                tracing::debug!(?parent_path, "invalidate cache");
+                self.attr_cache.remove(parent_path);
+                self.dirent_cache.remove(parent_path);
+                req.reply(())
+            }
+            Err(errno) => {
+                tracing::error!(?errno);
+                req.reply_error(errno)
+            }
         }
+    }
 
-        tracing::debug!(?path, "invalidate cache");
-        self.attr_cache.remove(&path);
-        self.dirent_cache.remove(&path);
+    #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
+    async fn rmdir(&mut self, req: &Request, op: op::Rmdir<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.get(op.parent()) {
+            Some(path) => path,
+            None => return req.reply_error(libc::EINVAL),
+        };
 
-        tracing::debug!(?parent_path, "invalidate cache");
-        self.attr_cache.remove(parent_path);
-        self.dirent_cache.remove(parent_path);
+        let path = parent_path.join(op.name());
+        tracing::debug!(?path);
 
-        req.reply(())
+        match self.remote.rmdir(&path).await {
+            Ok(_) => {
+                tracing::debug!(?path, "invalidate cache");
+                self.attr_cache.remove(&path);
+                self.dirent_cache.remove(&path);
+                tracing::debug!(?parent_path, "invalidate cache");
+                self.attr_cache.remove(parent_path);
+                self.dirent_cache.remove(parent_path);
+                req.reply(())
+            }
+            Err(errno) => {
+                tracing::error!(?errno);
+                req.reply_error(errno)
+            }
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), newparent = op.newparent(), name = ?op.name(), newname = ?op.newname()))]
