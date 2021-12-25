@@ -723,12 +723,24 @@ impl Daemon {
         };
         tracing::debug!(?path);
 
-        let open_flags = match op.flags() as i32 & libc::O_ACCMODE {
+        let mut open_flags = match op.flags() as i32 & libc::O_ACCMODE {
             libc::O_RDONLY => sftp::OpenFlag::READ,
             libc::O_WRONLY => sftp::OpenFlag::WRITE,
             libc::O_RDWR => sftp::OpenFlag::READ | sftp::OpenFlag::WRITE,
             _ => sftp::OpenFlag::empty(),
         };
+        if op.flags() as i32 & libc::O_CREAT == libc::O_CREAT {
+            open_flags = open_flags | sftp::OpenFlag::CREAT;
+        }
+        if op.flags() as i32 & libc::O_EXCL == libc::O_EXCL {
+            open_flags = open_flags | sftp::OpenFlag::EXCL;
+        }
+        if op.flags() as i32 & libc::O_TRUNC == libc::O_TRUNC {
+            open_flags = open_flags | sftp::OpenFlag::TRUNC;
+        }
+        if op.flags() as i32 & libc::O_APPEND == libc::O_APPEND {
+            open_flags = open_flags | sftp::OpenFlag::APPEND;
+        }
 
         // TODO: Keep inode until the handle is released.
         let handle = Box::new(FileHandle {
