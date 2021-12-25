@@ -451,10 +451,17 @@ impl Daemon {
 
         if op.flags() & libc::RENAME_NOREPLACE == 0 {
             tracing::debug!(?new_path, "Trying to remove it first...");
-            if let Err(_) = self.remote.remove(&new_path).await {
-                tracing::debug!("sftp.remove failed");
-                return req.reply_error(libc::EEXIST)
-
+            match self.remote.remove(&new_path).await {
+                Ok(_) => {
+                    tracing::debug!("removed");
+                }
+                Err(libc::ENOENT) => {
+                    tracing::debug!("no such file");
+                }
+                Err(errno) => {
+                    tracing::debug!(?errno);
+                    return req.reply_error(libc::EEXIST);
+                }
             }
         }
 
