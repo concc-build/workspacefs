@@ -37,12 +37,13 @@ pub(crate) fn init(
 ) -> Result<(Sender<Message>, Daemon)> {
     let (sender, receiver) = mpsc::channel(100);
     let mut daemon = Daemon::new(config, sftp, receiver)?;
-    daemon.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(sftp::FileAttr {
+    daemon.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(remote::Stat {
         size: Some(0),
-        uid_gid: Some((0, 0)),
-        permissions: Some(libc::S_IFDIR | 0o0755),
-        ac_mod_time: Some((0, 0)),
-        extended: vec![],
+        atime: Some(0),
+        mtime: Some(0),
+        mode: Some(libc::S_IFDIR | 0o0755),
+        uid: Some(0),
+        gid: Some(0),
     }));
     daemon.dirent_cache.insert(PathBuf::from(".netfs.d"), Arc::new(vec![]));
     Ok((sender, daemon))
@@ -77,7 +78,7 @@ pub(crate) struct Daemon {
     negative_timeout: Duration,
 
     // cache
-    attr_cache: HashMap<PathBuf, Arc<sftp::FileAttr>>,
+    attr_cache: HashMap<PathBuf, Arc<remote::Stat>>,
     dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
 
     page_cache_xglobset: GlobSet,
@@ -173,7 +174,7 @@ impl Daemon {
             let generation = inode.generation;
 
             let mut out = EntryOut::default();
-            self.fill_attr(out.attr(), &stat);
+            self.fill_attr(&stat, out.attr());
             out.ttl_attr(self.attr_timeout);
             out.ttl_entry(self.entry_timeout);
             out.ino(ino);
@@ -193,7 +194,7 @@ impl Daemon {
                 let generation = inode.generation;
 
                 let mut out = EntryOut::default();
-                self.fill_attr(out.attr(), &stat);
+                self.fill_attr(&stat, out.attr());
                 out.ttl_attr(self.attr_timeout);
                 out.ttl_entry(self.entry_timeout);
                 out.ino(ino);
@@ -251,7 +252,7 @@ impl Daemon {
         if let Some(stat) = self.attr_cache.get(path) {
             tracing::debug!("hit cache");
             let mut out = AttrOut::default();
-            self.fill_attr(out.attr(), &stat);
+            self.fill_attr(&stat, out.attr());
             out.attr().ino(op.ino());
             out.ttl(Duration::from_secs(60));
             return req.reply(out);
@@ -270,7 +271,7 @@ impl Daemon {
         self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
-        self.fill_attr(out.attr(), &stat);
+        self.fill_attr(&stat, out.attr());
         out.attr().ino(op.ino());
         out.ttl(Duration::from_secs(60));
         req.reply(out)
@@ -278,49 +279,37 @@ impl Daemon {
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
     async fn setattr(&mut self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
-        const NO_UID: u32 = unsafe {
-            mem::transmute::<i32, u32>(-1)
-        };
-        const NO_GID: u32 = unsafe {
-            mem::transmute::<i32, u32>(-1)
-        };
-
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
         };
         tracing::debug!(?path);
 
-        let mut stat = sftp::FileAttr::default();
-        stat.size = op.size();
-        let uid = op.uid().map(|uid| self.rmap_uid(uid));
-        let gid = op.gid().map(|gid| self.rmap_gid(gid));
-        stat.uid_gid = match (uid, gid) {
-            (Some(uid), Some(gid)) => Some((uid, gid)),
-            (Some(uid), None) => Some((uid, NO_GID)),
-            (None, Some(gid)) => Some((NO_UID, gid)),
-            _ => None,
-        };
-        stat.permissions = op.mode();
-        // SFTP protocol does not support changing only one of two.
-        stat.ac_mod_time = op.atime().zip(op.mtime())
-            .map(|times| {
-                let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|dur| dur.as_secs() as u32)
-                    .ok();
-                match (times, now) {
-                    ((op::SetAttrTime::Timespec(atime), op::SetAttrTime::Timespec(mtime)), _) =>
-                        Some((atime.as_secs() as u32, mtime.as_secs() as u32)),
-                    ((op::SetAttrTime::Timespec(atime), op::SetAttrTime::Now), Some(now)) =>
-                        Some((atime.as_secs() as u32, now)),
-                    ((op::SetAttrTime::Now, op::SetAttrTime::Timespec(mtime)), Some(now)) =>
-                        Some((now, mtime.as_secs() as u32)),
-                    ((_, _), Some(now)) => Some((now, now)),
-                    _ => None,
-                }
+        fn convert_time(
+            time: Option<op::SetAttrTime>,
+            now: Option<u32>
+        ) -> Option<u32> {
+            time.map(|time| match time {
+                op::SetAttrTime::Timespec(time) => Some(time.as_secs() as u32),
+                op::SetAttrTime::Now => now,
+                _ => None,
             })
-            .flatten();
-        if let Err(errno) = self.remote.setstat(&path, &stat).await {
+            .flatten()
+        }
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| dur.as_secs() as u32)
+            .ok();
+
+        let mut stat = remote::Stat::default();
+        stat.size = op.size();
+        stat.mode = op.mode();
+        stat.atime = convert_time(op.atime(), now);
+        stat.mtime = convert_time(op.mtime(), now);
+        stat.uid = op.uid().map(|uid| self.rmap_uid(uid));
+        stat.gid = op.gid().map(|gid| self.rmap_gid(gid));
+        if let Err(errno) = self.remote.setstat(&path, stat).await {
             tracing::error!(?errno);
             return req.reply_error(errno);
         }
@@ -335,7 +324,7 @@ impl Daemon {
         self.attr_cache.insert(path.to_owned(), stat.clone());
 
         let mut out = AttrOut::default();
-        self.fill_attr(out.attr(), &stat);
+        self.fill_attr(&stat, out.attr());
         out.attr().ino(op.ino());
         out.ttl(Duration::from_secs(60));
         req.reply(out)
@@ -396,7 +385,7 @@ impl Daemon {
         let generation = inode.generation;
 
         let mut out = EntryOut::default();
-        self.fill_attr(out.attr(), &stat);
+        self.fill_attr(&stat, out.attr());
         out.ttl_attr(self.attr_timeout);
         out.ttl_entry(self.entry_timeout);
         out.ino(ino);
@@ -440,7 +429,7 @@ impl Daemon {
         let generation = inode.generation;
 
         let mut entry_out = EntryOut::default();
-        self.fill_attr(entry_out.attr(), &stat);
+        self.fill_attr(&stat, entry_out.attr());
         entry_out.ttl_attr(self.entry_timeout);
         entry_out.ttl_entry(self.attr_timeout);
         entry_out.ino(ino);
@@ -605,9 +594,35 @@ impl Daemon {
         };
 
         let mut entries = vec![];
+        if op.ino() == ROOT_INO {
+            entries.push(DirEntry {
+                name: ".netfs.d".to_string(),
+                ino: NO_INO,
+                typ: libc::S_IFDIR,
+            });
+        }
         loop {
             match self.remote.readdir(&handle).await {
-                Ok(mut new_entries) => entries.append(&mut new_entries),
+                Ok(new_entries) => {
+                    for entry in new_entries.into_iter() {
+                        if entry.name == "." || entry.name == ".." {
+                            continue;
+                        }
+                        let ino = if cfg!(target_os = "linux") {
+                            NO_INO
+                        } else {
+                            let entry_path = path.join(&entry.name);
+                            self.path_table
+                                .lookup_ino(&entry_path)
+                                .unwrap_or(NO_INO)
+                        };
+                        entries.push(DirEntry {
+                            name: entry.name,
+                            typ: entry.kind,
+                            ino,
+                        });
+                    }
+                }
                 Err(0) => break,
                 Err(errno) => {
                     tracing::error!(?errno);
@@ -615,50 +630,11 @@ impl Daemon {
                 }
             }
         }
+        tracing::debug!(num = entries.len());
 
         self.invoke_close(handle);
 
-        let mut dst = vec![];
-        if op.ino() == ROOT_INO {
-            dst.push(DirEntry {
-                name: ".netfs.d".to_string(),
-                ino: NO_INO,
-                typ: libc::S_IFDIR,
-            });
-        }
-        for entry in entries.into_iter() {
-            if entry.filename == "." || entry.filename == ".." {
-                continue;
-            }
-
-            let entry_path = path.join(&entry.filename);
-
-            let ino = if cfg!(target_os = "linux") {
-                NO_INO
-            } else {
-                self.path_table.lookup_ino(&entry_path).unwrap_or(NO_INO)
-            };
-
-            let typ = entry
-                .attrs
-                .permissions
-                .map_or(libc::DT_REG as u32, |perm| {
-                    (perm & libc::S_IFMT) >> 12
-                });
-
-            tracing::debug!(?entry_path, attr = ?entry.attrs, "cache attr");
-            let stat = Arc::new(entry.attrs);
-            self.attr_cache.insert(entry_path, stat);
-
-            dst.push(DirEntry {
-                name: entry.filename,
-                ino,
-                typ,
-            });
-        }
-        tracing::debug!(num = dst.len());
-
-        let entries = Arc::new(dst);
+        let entries = Arc::new(entries);
         self.dirent_cache.insert(path.clone(), entries.clone());
 
         let handle = Box::new(DirHandle { entries });
@@ -789,10 +765,7 @@ impl Daemon {
             open_flags = open_flags | sftp::OpenFlag::APPEND;
         }
 
-        let mut attr = sftp::FileAttr::default();
-        attr.permissions = Some(op.mode());
-
-        let handle = match self.remote.open(&path, open_flags, &attr).await {
+        let handle = match self.remote.open(&path, open_flags, Some(op.mode())).await {
             Ok(file) => file,
             Err(errno) => {
                 tracing::error!(?errno);
@@ -830,7 +803,7 @@ impl Daemon {
         tracing::debug!(?fh);
 
         let mut entry_out = EntryOut::default();
-        self.fill_attr(entry_out.attr(), &stat);
+        self.fill_attr(&stat, entry_out.attr());
         entry_out.ttl_attr(self.entry_timeout);
         entry_out.ttl_entry(self.attr_timeout);
         entry_out.ino(ino);
@@ -993,17 +966,18 @@ impl Daemon {
         self.gid_rmap.get(&gid).cloned().unwrap_or(gid)
     }
 
-    fn fill_attr(&self, attr: &mut FileAttr, st: &sftp::FileAttr) {
-        let size = st.size.unwrap_or(0);
-        let uid = st.uid().map(|uid| self.map_uid(uid)).unwrap_or(0);
-        let gid = st.gid().map(|gid| self.map_gid(gid)).unwrap_or(0);
-        let mtime = Duration::from_secs(st.mtime().unwrap_or(0).into());
+    fn fill_attr(&self, stat: &remote::Stat, attr: &mut FileAttr) {
+        let size = stat.size.unwrap_or(0);
+        let uid = stat.uid.map(|uid| self.map_uid(uid)).unwrap_or(0);
+        let gid = stat.gid.map(|gid| self.map_gid(gid)).unwrap_or(0);
+        let atime = Duration::from_secs(stat.atime.unwrap_or(0).into());
+        let mtime = Duration::from_secs(stat.mtime.unwrap_or(0).into());
 
         attr.size(size);
-        attr.mode(st.permissions.unwrap_or(0));
+        attr.mode(stat.mode.unwrap_or(0));
         attr.uid(uid);
         attr.gid(gid);
-        attr.atime(Duration::from_secs(st.atime().unwrap_or(0).into()));
+        attr.atime(atime);
         attr.mtime(mtime);
         attr.ctime(mtime);
 
@@ -1047,8 +1021,7 @@ impl Daemon {
             None => return Err(libc::EINVAL),
         };
 
-        let attr = Default::default();
-        let remote_handle = match remote.open(&path, open_flags, &attr).await {
+        let remote_handle = match remote.open(&path, open_flags, None).await {
             Ok(handle) => handle,
             Err(errno) => return Err(errno),
         };

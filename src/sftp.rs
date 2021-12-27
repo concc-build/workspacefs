@@ -99,7 +99,7 @@ const MAX_READ: usize = 65536;
 const MAX_WRITE: usize = 65536;
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("errored in underlying transport I/O")]
     Transport(
         #[from]
@@ -124,7 +124,7 @@ pub enum Error {
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
 #[derive(Default)]
 #[non_exhaustive]
-pub struct FileAttr {
+struct FileAttr {
     pub size: Option<u64>,
     pub uid_gid: Option<(u32, u32)>,
     pub permissions: Option<u32>,
@@ -215,6 +215,44 @@ impl FileAttr {
     }
 }
 
+impl From<Stat> for FileAttr {
+    fn from(stat: Stat) -> Self {
+        const NO_UID: u32 = 0xFFFFFFFF;
+        const NO_GID: u32 = 0xFFFFFFFF;
+
+        Self {
+            size: stat.size,
+            uid_gid: match (stat.uid, stat.gid) {
+                (Some(uid), Some(gid)) => Some((uid, gid)),
+                (Some(uid), None) => Some((uid, NO_GID)),
+                (None, Some(gid)) => Some((NO_UID, gid)),
+                _ => None,
+            },
+            permissions: stat.mode,
+            ac_mod_time: match (stat.atime, stat.mtime) {
+                (Some(atime), Some(mtime)) => Some((atime, mtime)),
+                (Some(atime), None) => Some((atime, 0)),
+                (None, Some(mtime)) => Some((0, mtime)),
+                _ => None,
+            },
+            extended: vec![],
+        }
+    }
+}
+
+impl Into<Stat> for FileAttr {
+    fn into(self) -> Stat {
+        Stat {
+            size: self.size,
+            atime: self.atime(),
+            mtime: self.mtime(),
+            mode: self.permissions,
+            uid: self.uid(),
+            gid: self.gid(),
+        }
+    }
+}
+
 impl fmt::Debug for FileAttr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "(")?;
@@ -237,20 +275,12 @@ impl fmt::Debug for FileAttr {
     }
 }
 
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct DirEntry {
-    pub filename: String,
-    pub longname: String,
-    pub attrs: FileAttr,
-}
-
 #[derive(Debug, Clone)]
-pub struct FileHandle(Vec<u8>);
+pub(crate) struct FileHandle(Vec<u8>);
 
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
-pub struct Session {
+pub(crate) struct Session {
     base_path: PathBuf,
     inner: Weak<Inner>,
 }
@@ -266,11 +296,11 @@ impl Session {
     }
 
     /// Request to open a file.
-    pub async fn open<P>(
+    pub(crate) async fn open<P>(
         &self,
         filename: P,
         pflags: OpenFlag,
-        attrs: &FileAttr,
+        mode: Option<u32>,
     ) -> Result<FileHandle, i32>
     where
         P: AsRef<Path>,
@@ -278,6 +308,8 @@ impl Session {
         let path = self.base_path.join(filename.as_ref());
         let path = path.to_str().expect("must be a UTF-8 string").as_bytes();
 
+        let mut attrs = FileAttr::default();
+        attrs.permissions = mode;
         let len = 8 + path.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(len);
@@ -300,7 +332,7 @@ impl Session {
     }
 
     /// Request to close a file corresponding to the specified handle.
-    pub async fn close(&self, handle: &FileHandle) -> Result<(), i32> {
+    pub(crate) async fn close(&self, handle: &FileHandle) -> Result<(), i32> {
         let len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(len);
@@ -323,7 +355,7 @@ impl Session {
     /// Request to read a range of data from an opened file corresponding to the specified handle.
     #[instrument(name = "sftp.read", level = "debug", skip_all,
                  fields(handle = ?handle.0, offset, len))]
-    pub async fn read(
+    pub(crate) async fn read(
         &self,
         handle: &FileHandle,
         offset: u64,
@@ -358,7 +390,7 @@ impl Session {
         Ok((nread, chunks))
     }
 
-    pub async fn read_chunk(
+    async fn read_chunk(
         &self,
         handle: &FileHandle,
         offset: usize,
@@ -397,7 +429,7 @@ impl Session {
     /// Request to write a range of data to an opened file corresponding to the specified handle.
     #[instrument(name = "sftp.write", level = "debug", skip_all,
                  fields(handle = ?handle.0, offset, len = data.len()))]
-    pub async fn write(
+    pub(crate) async fn write(
         &self,
         handle: &FileHandle,
         offset: u64,
@@ -460,7 +492,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
-    pub async fn lstat<P>(&self, path: P) -> Result<FileAttr, i32>
+    pub(crate) async fn lstat<P>(&self, path: P) -> Result<Stat, i32>
     where
         P: AsRef<Path>,
     {
@@ -477,7 +509,7 @@ impl Session {
         match self.request(SSH_FXP_LSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => {
                 tracing::debug!("done");
-                Ok(attrs)
+                Ok(attrs.into())
             }
             Response::Status { code, msg, .. } => {
                 tracing::debug!(code, ?msg);
@@ -492,7 +524,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
-    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, i32> {
+    pub(crate) async fn fstat(&self, handle: &FileHandle) -> Result<Stat, i32> {
         let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -500,7 +532,7 @@ impl Session {
         payload.put(&handle.0[..]);
 
         match self.request(SSH_FXP_FSTAT, vec![payload.freeze()]).await? {
-            Response::Attrs(attrs) => Ok(attrs),
+            Response::Attrs(attrs) => Ok(attrs.into()),
             Response::Status { code, msg, .. } => {
                 tracing::debug!(code, ?msg);
                 Err(status_code_to_errno(code))
@@ -513,7 +545,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
-    pub async fn setstat<P>(&self, path: P, attrs: &FileAttr) -> Result<(), i32>
+    pub(crate) async fn setstat<P>(&self, path: P, stat: Stat) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -521,6 +553,7 @@ impl Session {
         tracing::debug!(?path);
         let path = path.to_str().expect("must be a valid Unicode").as_bytes();
 
+        let attrs = FileAttr::from(stat);
         let payload_len = 4 + path.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -542,7 +575,8 @@ impl Session {
     }
 
     #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
-    pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), i32> {
+    pub(crate) async fn fsetstat(&self, handle: &FileHandle, stat: Stat) -> Result<(), i32> {
+        let attrs = FileAttr::from(stat);
         let payload_len = 4 + handle.0.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -565,7 +599,7 @@ impl Session {
 
     /// Request to open a directory for reading.
     #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
-    pub async fn opendir<P>(&self, path: P) -> Result<FileHandle, i32>
+    pub(crate) async fn opendir<P>(&self, path: P) -> Result<FileHandle, i32>
     where
         P: AsRef<Path>,
     {
@@ -594,7 +628,7 @@ impl Session {
 
     /// Request to list files and directories contained in an opened directory.
     #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
-    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, i32> {
+    pub(crate) async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, i32> {
         let payload_len = 4 + handle.0.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
@@ -616,7 +650,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.remove", level = "debug", skip_all)]
-    pub async fn remove<P>(&self, path: P) -> Result<(), i32>
+    pub(crate) async fn remove<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -644,7 +678,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
-    pub async fn mkdir<P>(&self, path: P, mode: u32) -> Result<(), i32>
+    pub(crate) async fn mkdir<P>(&self, path: P, mode: u32) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -676,7 +710,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
-    pub async fn rmdir<P>(&self, path: P) -> Result<(), i32>
+    pub(crate) async fn rmdir<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -704,7 +738,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
-    pub async fn realpath<P>(&self, path: P) -> Result<String, i32>
+    pub(crate) async fn realpath<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -719,8 +753,9 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_REALPATH, vec![payload.freeze()]).await? {
-            Response::Name(mut entries) =>
-                Ok(mem::replace(&mut entries[0].filename, "".to_string())),
+            Response::Name(mut entries) => {
+                Ok(mem::replace(&mut entries[0].name, "".to_string()))
+            }
             Response::Status { code, msg, .. } => {
                 tracing::debug!(code, ?msg);
                 Err(status_code_to_errno(code))
@@ -734,7 +769,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[instrument(name = "sftp.stat", level = "debug", skip_all)]
-    pub async fn stat<P>(&self, path: P) -> Result<FileAttr, i32>
+    pub(crate) async fn stat<P>(&self, path: P) -> Result<Stat, i32>
     where
         P: AsRef<Path>,
     {
@@ -749,7 +784,7 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_STAT, vec![payload.freeze()]).await? {
-            Response::Attrs(attrs) => Ok(attrs),
+            Response::Attrs(attrs) => Ok(attrs.into()),
             Response::Status { code, msg, .. } => {
                 tracing::debug!(code, ?msg);
                 Err(status_code_to_errno(code))
@@ -762,7 +797,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.rename", level = "debug", skip_all)]
-    pub async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), i32>
+    pub(crate) async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -807,7 +842,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
-    pub async fn readlink<P>(&self, path: P) -> Result<String, i32>
+    pub(crate) async fn readlink<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -822,7 +857,9 @@ impl Session {
         payload.put(path);
 
         match self.request(SSH_FXP_READLINK, vec![payload.freeze()]).await? {
-            Response::Name(mut entries) => Ok(entries.remove(0).filename),
+            Response::Name(mut entries) => {
+                Ok(mem::replace(&mut entries[0].name, "".to_string()))
+            }
             Response::Status { code, msg, .. } => {
                 tracing::debug!(code, ?msg);
                 Err(status_code_to_errno(code))
@@ -835,7 +872,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
-    pub async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), i32>
+    pub(crate) async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), i32>
     where
         P: AsRef<Path>,
         Q: AsRef<Path> + fmt::Debug,
@@ -899,7 +936,7 @@ impl Session {
     }
 
     #[instrument(name = "sftp.extended", level = "debug", skip_all)]
-    pub async fn extended<R>(&self, request: &str, data: Bytes) -> Result<Vec<u8>, i32> {
+    async fn extended<R>(&self, request: &str, data: Bytes) -> Result<Vec<u8>, i32> {
         let request = request.as_bytes();
 
         let payload_len = 4 + request.len();
@@ -938,7 +975,7 @@ impl Session {
 bitflags::bitflags! {
     /// Open file flags.
     #[repr(transparent)]
-    pub struct OpenFlag: u32 {
+    pub(crate) struct OpenFlag: u32 {
         /// Open the file for reading.
         const READ = SSH_FXF_READ;
 
@@ -1020,7 +1057,7 @@ impl Inner {
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Connection {
+pub(crate) struct Connection {
     child: Child,
     inner: Arc<Inner>,
     send_task: JoinHandle<()>,
@@ -1091,12 +1128,12 @@ impl InitSession {
     ///
     /// This flag is enabled by default, as most SFTP servers are expected to
     /// use OpenSSH's implementation.
-    pub fn reverse_symlink_arguments(&mut self, enabled: bool) -> &mut Self {
+    pub(crate) fn reverse_symlink_arguments(&mut self, enabled: bool) -> &mut Self {
         self.reverse_symlink_arguments = enabled;
         self
     }
 
-    pub fn extension(&mut self, name: String, data: String) -> &mut Self {
+    pub(crate) fn extension(&mut self, name: String, data: String) -> &mut Self {
         self.extensions.push((name, data));
         self
     }
@@ -1265,12 +1302,13 @@ async fn recv_loop(
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
                     let filename = packet.read_string().await?;
-                    let longname = packet.read_string().await?;
+                    let _longname = packet.read_string().await?;
                     let attrs = packet.read_attr().await?;
                     entries.push(DirEntry {
-                        filename,
-                        longname,
-                        attrs,
+                        kind: attrs.permissions.map_or(libc::DT_REG as u32, |perm| {
+                            (perm & libc::S_IFMT) >> 12
+                        }),
+                        name: filename,
                     });
                 }
                 tracing::trace!(id, r#type = "NAME", count);
