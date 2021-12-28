@@ -36,16 +36,7 @@ pub(crate) fn init(
     sftp: sftp::Session,
 ) -> Result<(Sender<Message>, Daemon)> {
     let (sender, receiver) = mpsc::channel(100);
-    let mut daemon = Daemon::new(config, sftp, receiver)?;
-    daemon.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(remote::Stat {
-        size: Some(0),
-        atime: Some(0),
-        mtime: Some(0),
-        mode: Some(libc::S_IFDIR | 0o0755),
-        uid: Some(0),
-        gid: Some(0),
-    }));
-    daemon.dirent_cache.insert(PathBuf::from(".netfs.d"), Arc::new(vec![]));
+    let daemon = Daemon::new(config, sftp, receiver)?;
     Ok((sender, daemon))
 }
 
@@ -62,8 +53,35 @@ impl fmt::Debug for Message {
 }
 
 pub(crate) struct Daemon {
-    remote: sftp::Session,
+    context: Context,
     receiver: Receiver<Message>,
+}
+
+impl Daemon {
+    pub(crate) fn new(
+        config: &Config,
+        remote: sftp::Session,
+        receiver: Receiver<Message>,
+    ) -> Result<Self> {
+        Ok(Self {
+            context: Context::new(config, remote)?,
+            receiver,
+        })
+    }
+
+    pub(crate) async fn run(mut self) -> Result<()> {
+        while let Some(msg) = self.receiver.recv().await {
+            match msg {
+                Message::Request(req) => self.context.handle_request(req).await?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct Context {
+    remote: sftp::Session,
     path_table: PathTable,
 
     // id maps: remote -> local
@@ -86,15 +104,10 @@ pub(crate) struct Daemon {
     negative_xglobset: GlobSet,
 }
 
-impl Daemon {
-    pub(crate) fn new(
-        config: &Config,
-        remote: sftp::Session,
-        receiver: Receiver<Message>,
-    ) -> Result<Self> {
-        Ok(Self {
+impl Context {
+    fn new(config: &Config, remote: sftp::Session) -> Result<Self> {
+        let mut context = Self {
             remote,
-            receiver,
             path_table: PathTable::new(),
             uid_map: Self::make_map(&config.uid_map),
             uid_rmap: Self::make_rmap(&config.uid_map),
@@ -111,21 +124,23 @@ impl Daemon {
                 &config.cache.dentry_cache.excludes, &config.cache.excludes)?,
             negative_xglobset: Self::make_globset(
                 &config.cache.negative.excludes, &config.cache.excludes)?,
-        })
-    }
+        };
 
-    pub(crate) async fn run(mut self) -> Result<()> {
-        while let Some(msg) = self.receiver.recv().await {
-            match msg {
-                Message::Request(req) => self.handle_request(req).await?,
-            }
-        }
+        context.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(remote::Stat {
+            size: Some(0),
+            atime: Some(0),
+            mtime: Some(0),
+            mode: Some(libc::S_IFDIR | 0o0755),
+            uid: Some(0),
+            gid: Some(0),
+        }));
+        context.dirent_cache.insert(PathBuf::from(".netfs.d"), Arc::new(vec![]));
 
-        Ok(())
+        Ok(context)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(id = req.unique(), uid = req.uid(), gid = req.gid(), pid = req.pid()))]
-    pub async fn handle_request(&mut self, req: Request) -> Result<()> {
+    async fn handle_request(&mut self, req: Request) -> Result<()> {
         match req.operation()? {
             Operation::Lookup(op) => self.lookup(&req, op).await?,
             Operation::Forget(forgets) => self.forget(forgets.as_ref()),
