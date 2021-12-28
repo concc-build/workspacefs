@@ -1,6 +1,6 @@
 mod config;
 mod daemon;
-mod fs;
+mod fuse;
 mod remote;
 mod sftp;
 mod ssh;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         let _ = daemon.run().await;
     });
 
-    fs::mount(&opt.mountpoint, &config.fuse, sender).await?;
+    fuse::mount(&opt.mountpoint, &config.fuse, sender).await?;
 
     Ok(())
 }
