@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use dashmap::DashMap;
 use globset::Glob;
 use globset::GlobSet;
 use globset::GlobSetBuilder;
@@ -19,6 +20,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
@@ -53,7 +55,7 @@ impl fmt::Debug for Message {
 }
 
 pub(crate) struct Daemon {
-    context: Context,
+    context: Arc<Context>,
     receiver: Receiver<Message>,
 }
 
@@ -64,7 +66,7 @@ impl Daemon {
         receiver: Receiver<Message>,
     ) -> Result<Self> {
         Ok(Self {
-            context: Context::new(config, remote)?,
+            context: Arc::new(Context::new(config, remote)?),
             receiver,
         })
     }
@@ -72,7 +74,12 @@ impl Daemon {
     pub(crate) async fn run(mut self) -> Result<()> {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
-                Message::Request(req) => self.context.handle_request(req).await?,
+                Message::Request(req) => {
+                    let context = self.context.clone();
+                    tokio::spawn(async move {
+                        let _ = context.handle_request(req).await;
+                    });
+                }
             }
         }
 
@@ -82,7 +89,7 @@ impl Daemon {
 
 struct Context {
     remote: sftp::Session,
-    path_table: PathTable,
+    path_table: RwLock<PathTable>,
 
     // id maps: remote -> local
     uid_map: HashMap<u32, u32>,
@@ -96,8 +103,8 @@ struct Context {
     negative_timeout: Duration,
 
     // cache
-    attr_cache: HashMap<PathBuf, Arc<remote::Stat>>,
-    dirent_cache: HashMap<PathBuf, Arc<Vec<DirEntry>>>,
+    attr_cache: DashMap<PathBuf, Arc<remote::Stat>>,
+    dirent_cache: DashMap<PathBuf, Arc<Vec<DirEntry>>>,
 
     page_cache_xglobset: GlobSet,
     dentry_cache_xglobset: GlobSet,
@@ -106,9 +113,9 @@ struct Context {
 
 impl Context {
     fn new(config: &Config, remote: sftp::Session) -> Result<Self> {
-        let mut context = Self {
+        let context = Self {
             remote,
-            path_table: PathTable::new(),
+            path_table: RwLock::new(PathTable::new()),
             uid_map: Self::make_map(&config.uid_map),
             uid_rmap: Self::make_rmap(&config.uid_map),
             gid_map: Self::make_map(&config.gid_map),
@@ -116,8 +123,8 @@ impl Context {
             entry_timeout: config.cache.entry.timeout.clone().into(),
             attr_timeout: config.cache.attr.timeout.clone().into(),
             negative_timeout: config.cache.negative.timeout.clone().into(),
-            attr_cache: HashMap::new(),
-            dirent_cache: HashMap::new(),
+            attr_cache: DashMap::new(),
+            dirent_cache: DashMap::new(),
             page_cache_xglobset: Self::make_globset(
                 &config.cache.page_cache.excludes, &config.cache.excludes)?,
             dentry_cache_xglobset: Self::make_globset(
@@ -140,10 +147,10 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(id = req.unique(), uid = req.uid(), gid = req.gid(), pid = req.pid()))]
-    async fn handle_request(&mut self, req: Request) -> Result<()> {
+    async fn handle_request(&self, req: Request) -> Result<()> {
         match req.operation()? {
             Operation::Lookup(op) => self.lookup(&req, op).await?,
-            Operation::Forget(forgets) => self.forget(forgets.as_ref()),
+            Operation::Forget(forgets) => self.forget(forgets.as_ref()).await?,
             Operation::Getattr(op) => self.getattr(&req, op).await?,
             Operation::Setattr(op) => self.setattr(&req, op).await?,
             Operation::Readlink(op) => self.readlink(&req, op).await?,
@@ -155,12 +162,12 @@ impl Context {
             Operation::Opendir(op) => self.opendir(&req, op).await?,
             Operation::Readdir(op) => self.readdir(&req, op)?,
             Operation::Releasedir(op) => self.releasedir(&req, op)?,
-            Operation::Open(op) => self.open(&req, op)?,
+            Operation::Open(op) => self.open(&req, op).await?,
             Operation::Create(op) => self.create(&req, op).await?,
             Operation::Read(op) => self.read(&req, op).await?,
             Operation::Write(op, data) => self.write(&req, op, data).await?,
             Operation::Release(op) => self.release(&req, op)?,
-            Operation::Statfs(op) => self.statfs(&req, op)?,
+            Operation::Statfs(op) => self.statfs(&req, op).await?,
             Operation::Interrupt(op) => self.interrupt(&req,op)?,
             op @ _ => {
                 tracing::trace!(?op);
@@ -172,8 +179,8 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
-    async fn lookup(&mut self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.parent()) {
+    async fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.parent()) {
             Some(parent) => parent.join(op.name()),
             None => {
                 tracing::error!("no inode registered");
@@ -184,7 +191,7 @@ impl Context {
 
         if let Some(stat) = self.attr_cache.get(&path) {
             tracing::debug!("hit cache");
-            let (ino, generation) = self.path_table.recognize(&path);
+            let (ino, generation) = self.path_table.write().await.recognize(&path);
 
             let mut out = EntryOut::default();
             self.fill_attr(&stat, out.attr());
@@ -202,7 +209,7 @@ impl Context {
                 let stat = Arc::new(stat);
                 self.attr_cache.insert(path.clone(), stat.clone());
 
-                let (ino, generation) = self.path_table.recognize(&path);
+                let (ino, generation) = self.path_table.write().await.recognize(&path);
 
                 let mut out = EntryOut::default();
                 self.fill_attr(&stat, out.attr());
@@ -242,17 +249,19 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    fn forget(&mut self, forgets: &[op::Forget]) {
+    async fn forget(&self, forgets: &[op::Forget]) -> io::Result<()> {
+        let mut path_table = self.path_table.write().await;
         for forget in forgets {
             tracing::debug!(ino = forget.ino(), nlookup = forget.nlookup());
-            self.path_table.forget(forget.ino(), forget.nlookup());
+            path_table.forget(forget.ino(), forget.nlookup());
         }
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    async fn getattr(&mut self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+    async fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => {
                 tracing::error!("no inode registered");
                 return req.reply_error(libc::EINVAL);
@@ -260,7 +269,7 @@ impl Context {
         };
         tracing::debug!(?path);
 
-        if let Some(stat) = self.attr_cache.get(path) {
+        if let Some(stat) = self.attr_cache.get(&path) {
             tracing::debug!("hit cache");
             let mut out = AttrOut::default();
             self.fill_attr(&stat, out.attr());
@@ -289,9 +298,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    async fn setattr(&mut self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+    async fn setattr(&self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
         tracing::debug!(?path);
@@ -342,9 +351,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
-    async fn readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+    async fn readlink(&self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
         tracing::debug!(?path);
@@ -358,9 +367,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name(), link = ?op.link()))]
-    async fn symlink(&mut self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
-        let parent_path = match self.path_table.get(op.parent()) {
-            Some(path) => path,
+    async fn symlink(&self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.read().await.get(op.parent()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
@@ -388,10 +397,10 @@ impl Context {
         self.attr_cache.insert(link_path.clone(), stat.clone());
 
         tracing::debug!(?parent_path, "invalidate cache");
-        self.attr_cache.remove(parent_path);
-        self.dirent_cache.remove(parent_path);
+        self.attr_cache.remove(&parent_path);
+        self.dirent_cache.remove(&parent_path);
 
-        let (ino, generation) = self.path_table.recognize(&link_path);
+        let (ino, generation) = self.path_table.write().await.recognize(&link_path);
 
         let mut out = EntryOut::default();
         self.fill_attr(&stat, out.attr());
@@ -404,8 +413,8 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
-    async fn mkdir(&mut self, req: &Request, op: op::Mkdir<'_>) -> io::Result<()> {
-        let parent_path = match self.path_table.get(op.parent()) {
+    async fn mkdir(&self, req: &Request, op: op::Mkdir<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
@@ -433,7 +442,7 @@ impl Context {
         self.attr_cache.remove(&parent_path);
         self.dirent_cache.remove(&parent_path);
 
-        let (ino, generation) = self.path_table.recognize(&path);
+        let (ino, generation) = self.path_table.write().await.recognize(&path);
 
         let mut entry_out = EntryOut::default();
         self.fill_attr(&stat, entry_out.attr());
@@ -447,9 +456,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
-    async fn unlink(&mut self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
-        let parent_path = match self.path_table.get(op.parent()) {
-            Some(path) => path,
+    async fn unlink(&self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.read().await.get(op.parent()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
@@ -462,8 +471,8 @@ impl Context {
                 self.attr_cache.remove(&path);
                 self.dirent_cache.remove(&path);
                 tracing::debug!(?parent_path, "invalidate cache");
-                self.attr_cache.remove(parent_path);
-                self.dirent_cache.remove(parent_path);
+                self.attr_cache.remove(&parent_path);
+                self.dirent_cache.remove(&parent_path);
                 req.reply(())
             }
             Err(errno) => {
@@ -474,9 +483,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
-    async fn rmdir(&mut self, req: &Request, op: op::Rmdir<'_>) -> io::Result<()> {
-        let parent_path = match self.path_table.get(op.parent()) {
-            Some(path) => path,
+    async fn rmdir(&self, req: &Request, op: op::Rmdir<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.read().await.get(op.parent()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
@@ -489,8 +498,8 @@ impl Context {
                 self.attr_cache.remove(&path);
                 self.dirent_cache.remove(&path);
                 tracing::debug!(?parent_path, "invalidate cache");
-                self.attr_cache.remove(parent_path);
-                self.dirent_cache.remove(parent_path);
+                self.attr_cache.remove(&parent_path);
+                self.dirent_cache.remove(&parent_path);
                 req.reply(())
             }
             Err(errno) => {
@@ -501,13 +510,13 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), newparent = op.newparent(), name = ?op.name(), newname = ?op.newname()))]
-    async fn rename(&mut self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
-        let old_parent_path = match self.path_table.get(op.parent()) {
+    async fn rename(&self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
+        let old_parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let new_parent_path = match self.path_table.get(op.newparent()) {
+        let new_parent_path = match self.path_table.read().await.get(op.newparent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
@@ -539,7 +548,7 @@ impl Context {
 
         match self.remote.rename(&old_path, &new_path).await {
             Ok(()) => {
-                self.path_table.rename(&old_path, &new_path);
+                self.path_table.write().await.rename(&old_path, &new_path);
                 tracing::debug!(?old_path, "invalidate cache");
                 self.attr_cache.remove(&old_path);
                 self.dirent_cache.remove(&old_path);
@@ -568,11 +577,11 @@ impl Context {
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
     async fn opendir(
-        &mut self,
+        &self,
         req: &Request,
         op: op::Opendir<'_>
     ) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
+        let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
@@ -620,6 +629,8 @@ impl Context {
                         } else {
                             let entry_path = path.join(&entry.name);
                             self.path_table
+                                .read()
+                                .await
                                 .lookup_ino(&entry_path)
                                 .unwrap_or(NO_INO)
                         };
@@ -657,7 +668,7 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    fn readdir(&mut self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
+    fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
         tracing::debug!(offset = op.offset(), size = op.size());
 
         if op.mode() == op::ReaddirMode::Plus {
@@ -691,7 +702,7 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh()))]
-    fn releasedir(&mut self, req: &Request, op: op::Releasedir<'_>) -> io::Result<()> {
+    fn releasedir(&self, req: &Request, op: op::Releasedir<'_>) -> io::Result<()> {
         let _ = DirHandle::from_fh(op.fh());
         tracing::debug!("released");
 
@@ -699,9 +710,9 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
-    fn open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+    async fn open(&self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
         tracing::debug!(?path);
@@ -744,8 +755,8 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", name = "create", skip_all, fields(parent = op.parent(), name = ?op.name()))]
-    async fn create(&mut self, req: &Request, op: op::Create<'_>) -> io::Result<()> {
-        let parent_path = match self.path_table.get(op.parent()) {
+    async fn create(&self, req: &Request, op: op::Create<'_>) -> io::Result<()> {
+        let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
@@ -797,7 +808,7 @@ impl Context {
         self.attr_cache.remove(&parent_path);
         self.dirent_cache.remove(&parent_path);
 
-        let (ino, generation) = self.path_table.recognize(&path);
+        let (ino, generation) = self.path_table.write().await.recognize(&path);
 
         let handle = Box::new(FileHandle {
             path: path.clone(),
@@ -825,7 +836,7 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
-    async fn read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
+    async fn read(&self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
         let remote = self.remote.clone();
         let fh = op.fh();
         let offset = op.offset();
@@ -858,17 +869,17 @@ impl Context {
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino(), fh = op.fh(), offset = op.offset(), size = op.size()))]
     async fn write(
-        &mut self,
+        &self,
         req: &Request,
         op: op::Write<'_>,
         data: Bytes,
     ) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+        let path = match self.path_table.read().await.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
         tracing::debug!(?path, "invalidate cache");
-        self.attr_cache.remove(path);
+        self.attr_cache.remove(&path);
 
         let remote = self.remote.clone();
         let fh = op.fh();
@@ -919,8 +930,8 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(ino = op.ino()))]
-    fn statfs(&self, req: &Request, op: op::Statfs<'_>) -> io::Result<()> {
-        let path = match self.path_table.get(op.ino()) {
+    async fn statfs(&self, req: &Request, op: op::Statfs<'_>) -> io::Result<()> {
+        let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
@@ -947,7 +958,7 @@ impl Context {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    fn interrupt(&mut self, _req: &Request, _op: op::Interrupt<'_>
+    fn interrupt(&self, _req: &Request, _op: op::Interrupt<'_>
     ) -> io::Result<()> {
         // Currrently, a request is processed on a single thread.
         // So, stopping the processing of the request is not needed.
