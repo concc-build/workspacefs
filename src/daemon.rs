@@ -184,9 +184,7 @@ impl Context {
 
         if let Some(stat) = self.attr_cache.get(&path) {
             tracing::debug!("hit cache");
-            let inode = self.path_table.recognize(&path);
-            let ino = inode.ino;
-            let generation = inode.generation;
+            let (ino, generation) = self.path_table.recognize(&path);
 
             let mut out = EntryOut::default();
             self.fill_attr(&stat, out.attr());
@@ -204,9 +202,7 @@ impl Context {
                 let stat = Arc::new(stat);
                 self.attr_cache.insert(path.clone(), stat.clone());
 
-                let inode = self.path_table.recognize(&path);
-                let ino = inode.ino;
-                let generation = inode.generation;
+                let (ino, generation) = self.path_table.recognize(&path);
 
                 let mut out = EntryOut::default();
                 self.fill_attr(&stat, out.attr());
@@ -395,9 +391,7 @@ impl Context {
         self.attr_cache.remove(parent_path);
         self.dirent_cache.remove(parent_path);
 
-        let inode = self.path_table.recognize(&link_path);
-        let ino = inode.ino;
-        let generation = inode.generation;
+        let (ino, generation) = self.path_table.recognize(&link_path);
 
         let mut out = EntryOut::default();
         self.fill_attr(&stat, out.attr());
@@ -439,9 +433,7 @@ impl Context {
         self.attr_cache.remove(&parent_path);
         self.dirent_cache.remove(&parent_path);
 
-        let inode = self.path_table.recognize(&path);
-        let ino = inode.ino;
-        let generation = inode.generation;
+        let (ino, generation) = self.path_table.recognize(&path);
 
         let mut entry_out = EntryOut::default();
         self.fill_attr(&stat, entry_out.attr());
@@ -805,9 +797,7 @@ impl Context {
         self.attr_cache.remove(&parent_path);
         self.dirent_cache.remove(&parent_path);
 
-        let inode = self.path_table.recognize(&path);
-        let ino = inode.ino;
-        let generation = inode.generation;
+        let (ino, generation) = self.path_table.recognize(&path);
 
         let handle = Box::new(FileHandle {
             path: path.clone(),
@@ -1232,30 +1222,30 @@ impl PathTable {
     }
 
     fn get(&self, ino: u64) -> Option<&Path> {
-        self.inodes.get(&ino).map(|inode| &*inode.path)
+        self.inodes.get(&ino).map(|inode| inode.path.as_path())
     }
 
     fn lookup_ino(&self, path: &Path) -> Option<u64> {
         self.path_to_ino.get(path).cloned()
     }
 
-    fn recognize(&mut self, path: &Path) -> &mut INode {
+    fn recognize(&mut self, path: &Path) -> (u64, u64) {
         match self.path_to_ino.get(path) {
-            Some(&ino) => {
-                let mut inode = self.inodes.get_mut(&ino).expect("inode is missing");
+            Some(ino) => {
+                let mut inode = self.inodes.get_mut(ino).expect("inode is missing");
                 inode.refcount += 1;
-                inode
+                (inode.ino, inode.generation)
             }
             None => {
                 let (ino, generation) = self.make_next_ino();
-                let inode = self.inodes.entry(ino).or_insert_with(|| INode {
+                self.inodes.entry(ino).or_insert_with(|| INode {
                     refcount: 1,
                     ino,
                     generation,
                     path: path.to_owned(),
                 });
                 self.path_to_ino.insert(path.to_owned(), ino);
-                inode
+                (ino, generation)
             }
         }
     }
