@@ -133,7 +133,7 @@ impl Context {
                 &config.cache.negative.excludes, &config.cache.excludes)?,
         };
 
-        context.attr_cache.insert(PathBuf::from(".netfs.d"), Arc::new(remote::Stat {
+        context.attr_cache.insert(PathBuf::from(".workspacefs.d"), Arc::new(remote::Stat {
             size: Some(0),
             atime: Some(0),
             mtime: Some(0),
@@ -141,7 +141,7 @@ impl Context {
             uid: Some(0),
             gid: Some(0),
         }));
-        context.dirent_cache.insert(PathBuf::from(".netfs.d"), Arc::new(vec![]));
+        context.dirent_cache.insert(PathBuf::from(".workspacefs.d"), Arc::new(vec![]));
 
         Ok(context)
     }
@@ -612,7 +612,7 @@ impl Context {
         let mut entries = vec![];
         if op.ino() == ROOT_INO {
             entries.push(DirEntry {
-                name: ".netfs.d".to_string(),
+                name: ".workspacefs.d".to_string(),
                 ino: NO_INO,
                 typ: libc::S_IFDIR,
             });

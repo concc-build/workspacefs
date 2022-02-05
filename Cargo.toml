@@ -1,10 +1,10 @@
 [package]
-name = "sshfs"
+name = "workspacefs"
 version = "0.1.0"
+authors = [ "Contributes of concc-build" ]
+edition = "2021"
+description = "A network filesystem for distributed build systems"
 publish = false
-authors = [ "Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>" ]
-edition = "2018"
-description = "A SSHFS implementation written in Rust"
 
 [dependencies]
 anyhow = "1.0.47"
@@ -30,4 +30,4 @@ tracing = { version = "0.1.29", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.2", features = ["env-filter", "json"] }
 
 [profile.release]
-debug = true
+lto = true

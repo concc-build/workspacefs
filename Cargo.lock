@@ -707,33 +707,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ecab6c735a6bb4139c0caafd0cc3635748bbb3acf4550e8138122099251f309"
 
 [[package]]
-name = "sshfs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atty",
- "bitflags",
- "bytes",
- "dashmap",
- "futures",
- "globset",
- "humantime",
- "jemallocator",
- "libc",
- "polyfuse",
- "serde",
- "serde_with",
- "serde_yaml",
- "shell-words",
- "static_assertions",
- "structopt",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,6 +965,33 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "workspacefs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atty",
+ "bitflags",
+ "bytes",
+ "dashmap",
+ "futures",
+ "globset",
+ "humantime",
+ "jemallocator",
+ "libc",
+ "polyfuse",
+ "serde",
+ "serde_with",
+ "serde_yaml",
+ "shell-words",
+ "static_assertions",
+ "structopt",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "yaml-rust"
