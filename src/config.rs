@@ -25,6 +25,7 @@ pub(crate) struct Config {
     pub uid_map: Vec<IdMap>,
     #[serde(default)]
     pub gid_map: Vec<IdMap>,
+    #[serde(default)]
     pub cache: CacheConfigSet,
     pub remote: RemoteConfig,
 }
@@ -55,7 +56,7 @@ pub(crate) struct IdMap {
     pub remote: u32,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CacheConfigSet {
@@ -65,8 +66,11 @@ pub(crate) struct CacheConfigSet {
     pub page_cache: KernelCacheConfig,
     #[serde(default)]
     pub dentry_cache: KernelCacheConfig,
+    #[serde(default)]
     pub attr: CacheConfig,
+    #[serde(default)]
     pub entry: CacheConfig,
+    #[serde(default)]
     pub negative: CacheConfig,
 }
 
@@ -94,6 +98,15 @@ pub(crate) struct CacheConfig {
 impl CacheConfig {
     fn default_timeout() -> Duration {
         "0s".parse().unwrap()
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Self::default_timeout(),
+            excludes: Default::default(),
+        }
     }
 }
 
