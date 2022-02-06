@@ -115,7 +115,7 @@ struct Context {
 macro_rules! reply_error {
     ($req:ident, $errno:expr, $($arg:tt) *) => {
         {
-            tracing::error!(errno = $errno, cmd = %cmd_from_pid($req.pid()), $($arg)*);
+            tracing::error!(errno = $errno, $($arg)*);
             return $req.reply_error($errno);
         }
     };
@@ -158,6 +158,7 @@ impl Context {
 
     #[tracing::instrument(level = "debug", skip_all, fields(id = req.unique(), uid = req.uid(), gid = req.gid(), pid = req.pid()))]
     async fn handle_request(&self, req: Request) -> Result<()> {
+        tracing::debug!(cmd = %cmd_from_pid(req.pid()));
         match req.operation()? {
             Operation::Lookup(op) => self.lookup(&req, op).await?,
             Operation::Forget(forgets) => self.forget(forgets.as_ref()).await?,
@@ -180,7 +181,7 @@ impl Context {
             Operation::Statfs(op) => self.statfs(&req, op).await?,
             Operation::Interrupt(op) => self.interrupt(&req, op)?,
             op => {
-                tracing::trace!(?op, cmd = %cmd_from_pid(req.pid()), "Not implemented");
+                tracing::trace!(?op, "Not implemented");
                 req.reply_error(libc::ENOSYS)?
             }
         }
