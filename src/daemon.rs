@@ -78,7 +78,9 @@ impl Daemon {
                 Message::Request(req) => {
                     let context = self.context.clone();
                     tokio::spawn(async move {
-                        let _ = context.handle_request(req).await;
+                        if let Err(err) = context.handle_request(req).await {
+                            panic!("{}", err);
+                        }
                     });
                 }
             }
@@ -362,9 +364,7 @@ impl Context {
         tracing::debug!(?path);
 
         match self.remote.readlink(&path).await {
-            Ok(link) => {
-                req.reply(link)
-            }
+            Ok(link) => req.reply(link),
             Err(errno) => reply_error!(req, errno, "remote.readlink failed"),
         }
     }
@@ -629,6 +629,7 @@ impl Context {
 
         let handle = Box::new(DirHandle { entries });
         let fh = DirHandle::into_fh(handle);
+        tracing::debug!(?fh);
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -668,7 +669,7 @@ impl Context {
             nread += 1;
         }
 
-        tracing::debug!("read {} entries", nread);
+        tracing::debug!(nread);
         req.reply(out)
     }
 
