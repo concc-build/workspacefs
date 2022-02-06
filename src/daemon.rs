@@ -100,17 +100,16 @@ struct Context {
     gid_map: HashMap<u32, u32>,
     gid_rmap: HashMap<u32, u32>,
 
-    // timeout values for caching
-    entry_timeout: Duration,
-    attr_timeout: Duration,
-    negative_timeout: Duration,
-
     // cache
-    attr_cache: DashMap<PathBuf, Arc<remote::Stat>>,
+    attr_timeout: Duration,
     dirent_cache: DashMap<PathBuf, Arc<Vec<DirEntry>>>,
-
     page_cache_xglobset: GlobSet,
     dentry_cache_xglobset: GlobSet,
+    attr_cache: DashMap<PathBuf, Arc<remote::Stat>>,
+    attr_xglobset: GlobSet,
+    entry_timeout: Duration,
+    entry_xglobset: GlobSet,
+    negative_timeout: Duration,
     negative_xglobset: GlobSet,
 }
 
@@ -132,15 +131,19 @@ impl Context {
             uid_rmap: Self::make_rmap(&config.uid_map),
             gid_map: Self::make_map(&config.gid_map),
             gid_rmap: Self::make_rmap(&config.gid_map),
-            entry_timeout: config.cache.entry.timeout.clone().into(),
-            attr_timeout: config.cache.attr.timeout.clone().into(),
-            negative_timeout: config.cache.negative.timeout.clone().into(),
             attr_cache: DashMap::new(),
             dirent_cache: DashMap::new(),
             page_cache_xglobset: Self::make_globset(
                 &config.cache.page_cache.excludes, &config.cache.excludes)?,
             dentry_cache_xglobset: Self::make_globset(
                 &config.cache.dentry_cache.excludes, &config.cache.excludes)?,
+            attr_timeout: config.cache.attr.timeout.clone().into(),
+            attr_xglobset: Self::make_globset(
+                &config.cache.attr.excludes, &config.cache.excludes)?,
+            entry_timeout: config.cache.entry.timeout.clone().into(),
+            entry_xglobset: Self::make_globset(
+                &config.cache.entry.excludes, &config.cache.excludes)?,
+            negative_timeout: config.cache.negative.timeout.clone().into(),
             negative_xglobset: Self::make_globset(
                 &config.cache.negative.excludes, &config.cache.excludes)?,
         };
@@ -191,6 +194,22 @@ impl Context {
         Ok(())
     }
 
+    fn get_attr_timeout<P: AsRef<Path>>(&self, path: P) -> Duration {
+        if self.attr_xglobset.is_match(path.as_ref()) {
+            Duration::ZERO
+        } else {
+            self.attr_timeout
+        }
+    }
+
+    fn get_entry_timeout<P: AsRef<Path>>(&self, path: P) -> Duration {
+        if self.entry_xglobset.is_match(path.as_ref()) {
+            Duration::ZERO
+        } else {
+            self.entry_timeout
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name()))]
     async fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.parent()) {
@@ -215,16 +234,21 @@ impl Context {
 
         match self.remote.lstat(&path).await {
             Ok(stat) => {
-                tracing::debug!(?path, attr = ?stat, "cache attr");
+                let attr_timeout = self.get_attr_timeout(&path);
+                let entry_timeout = self.get_entry_timeout(&path);
+
                 let stat = Arc::new(stat);
-                self.attr_cache.insert(path.clone(), stat.clone());
+                if !attr_timeout.is_zero() {
+                    tracing::debug!(?path, attr = ?stat, "cache attr");
+                    self.attr_cache.insert(path.clone(), stat.clone());
+                }
 
                 let (ino, generation) = self.path_table.write().await.recognize(&path);
 
                 let mut out = EntryOut::default();
                 self.fill_attr(&stat, out.attr());
-                out.ttl_attr(self.attr_timeout);
-                out.ttl_entry(self.entry_timeout);
+                out.ttl_attr(attr_timeout);
+                out.ttl_entry(entry_timeout);
                 out.ino(ino);
                 out.generation(generation);
                 out.attr().ino(ino);
@@ -283,7 +307,7 @@ impl Context {
             let mut out = AttrOut::default();
             self.fill_attr(&stat, out.attr());
             out.attr().ino(op.ino());
-            out.ttl(Duration::from_secs(60));
+            out.ttl(self.attr_timeout);
             return req.reply(out);
         }
 
@@ -292,14 +316,18 @@ impl Context {
             Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
-        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let attr_timeout = self.get_attr_timeout(&path);
+
         let stat = Arc::new(stat);
-        self.attr_cache.insert(path.to_owned(), stat.clone());
+        if !attr_timeout.is_zero() {
+            tracing::debug!(?path, attr = ?stat, "cache attr");
+            self.attr_cache.insert(path.to_owned(), stat.clone());
+        }
 
         let mut out = AttrOut::default();
         self.fill_attr(&stat, out.attr());
         out.attr().ino(op.ino());
-        out.ttl(Duration::from_secs(60));
+        out.ttl(attr_timeout);
         req.reply(out)
     }
 
@@ -344,14 +372,18 @@ impl Context {
             Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
-        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let attr_timeout = self.get_attr_timeout(&path);
+
         let stat = Arc::new(stat);
-        self.attr_cache.insert(path.to_owned(), stat.clone());
+        if !attr_timeout.is_zero() {
+            tracing::debug!(?path, attr = ?stat, "cache attr");
+            self.attr_cache.insert(path.to_owned(), stat.clone());
+        }
 
         let mut out = AttrOut::default();
         self.fill_attr(&stat, out.attr());
         out.attr().ino(op.ino());
-        out.ttl(Duration::from_secs(60));
+        out.ttl(attr_timeout);
         req.reply(out)
     }
 
@@ -390,9 +422,14 @@ impl Context {
             Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
-        tracing::debug!(?link_path, attr = ?stat, "cache attr");
+        let attr_timeout = self.get_attr_timeout(&link_path);
+        let entry_timeout = self.get_entry_timeout(&link_path);
+
         let stat = Arc::new(stat);
-        self.attr_cache.insert(link_path.clone(), stat.clone());
+        if !attr_timeout.is_zero() {
+            tracing::debug!(?link_path, attr = ?stat, "cache attr");
+            self.attr_cache.insert(link_path.clone(), stat.clone());
+        }
 
         tracing::debug!(?parent_path, "invalidate cache");
         self.attr_cache.remove(&parent_path);
@@ -402,8 +439,8 @@ impl Context {
 
         let mut out = EntryOut::default();
         self.fill_attr(&stat, out.attr());
-        out.ttl_attr(self.attr_timeout);
-        out.ttl_entry(self.entry_timeout);
+        out.ttl_attr(attr_timeout);
+        out.ttl_entry(entry_timeout);
         out.ino(ino);
         out.generation(generation);
         out.attr().ino(ino);
@@ -428,9 +465,14 @@ impl Context {
             Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
-        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let attr_timeout = self.get_attr_timeout(&path);
+        let entry_timeout = self.get_entry_timeout(&path);
+
         let stat = Arc::new(stat);
-        self.attr_cache.insert(path.clone(), stat.clone());
+        if !attr_timeout.is_zero() {
+            tracing::debug!(?path, attr = ?stat, "cache attr");
+            self.attr_cache.insert(path.clone(), stat.clone());
+        }
 
         tracing::debug!(?parent_path, "invalidate cache");
         self.attr_cache.remove(&parent_path);
@@ -440,8 +482,8 @@ impl Context {
 
         let mut entry_out = EntryOut::default();
         self.fill_attr(&stat, entry_out.attr());
-        entry_out.ttl_attr(self.entry_timeout);
-        entry_out.ttl_entry(self.attr_timeout);
+        entry_out.ttl_attr(attr_timeout);
+        entry_out.ttl_entry(entry_timeout);
         entry_out.ino(ino);
         entry_out.generation(generation);
         entry_out.attr().ino(ino);
@@ -624,18 +666,22 @@ impl Context {
 
         self.invoke_close(handle);
 
-        let entries = Arc::new(entries);
-        self.dirent_cache.insert(path.clone(), entries.clone());
+        let do_cache = !self.dentry_cache_xglobset.is_match(&path);
 
-        let handle = Box::new(DirHandle { entries });
+        let entries = Arc::new(entries);
+        if do_cache {
+            self.dirent_cache.insert(path.clone(), entries.clone());
+        }
+
+        let handle = Box::new(DirHandle {
+            entries: entries.clone(),
+        });
         let fh = DirHandle::into_fh(handle);
         tracing::debug!(?fh);
 
         let mut out = OpenOut::default();
         out.fh(fh);
-        if !self.dentry_cache_xglobset.is_match(&path) {
-            out.cache_dir(true);
-        }
+        out.cache_dir(do_cache);
 
         req.reply(out)
     }
@@ -768,9 +814,14 @@ impl Context {
             }
         };
 
-        tracing::debug!(?path, attr = ?stat, "cache attr");
+        let attr_timeout = self.get_attr_timeout(&path);
+        let entry_timeout = self.get_entry_timeout(&path);
+
         let stat = Arc::new(stat);
-        self.attr_cache.insert(path.clone(), stat.clone());
+        if !attr_timeout.is_zero() {
+            tracing::debug!(?path, attr = ?stat, "cache attr");
+            self.attr_cache.insert(path.clone(), stat.clone());
+        }
 
         tracing::debug!(?parent_path, "invalidate cache");
         self.attr_cache.remove(&parent_path);
@@ -788,8 +839,8 @@ impl Context {
 
         let mut entry_out = EntryOut::default();
         self.fill_attr(&stat, entry_out.attr());
-        entry_out.ttl_attr(self.entry_timeout);
-        entry_out.ttl_entry(self.attr_timeout);
+        entry_out.ttl_attr(attr_timeout);
+        entry_out.ttl_entry(entry_timeout);
         entry_out.ino(ino);
         entry_out.generation(generation);
         entry_out.attr().ino(ino);
