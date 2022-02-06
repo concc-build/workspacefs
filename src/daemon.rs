@@ -8,6 +8,7 @@ use polyfuse::Operation;
 use polyfuse::Request;
 use polyfuse::op;
 use polyfuse::reply::*;
+use procfs;
 use static_assertions;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -111,6 +112,15 @@ struct Context {
     negative_xglobset: GlobSet,
 }
 
+macro_rules! reply_error {
+    ($req:ident, $errno:expr, $($arg:tt) *) => {
+        {
+            tracing::error!(errno = $errno, cmd = %cmd_from_pid($req.pid()), $($arg)*);
+            return $req.reply_error($errno);
+        }
+    };
+}
+
 impl Context {
     fn new(config: &Config, remote: sftp::Session) -> Result<Self> {
         let context = Self {
@@ -168,9 +178,9 @@ impl Context {
             Operation::Write(op, data) => self.write(&req, op, data).await?,
             Operation::Release(op) => self.release(&req, op)?,
             Operation::Statfs(op) => self.statfs(&req, op).await?,
-            Operation::Interrupt(op) => self.interrupt(&req,op)?,
-            op @ _ => {
-                tracing::trace!(?op);
+            Operation::Interrupt(op) => self.interrupt(&req, op)?,
+            op => {
+                tracing::trace!(?op, cmd = %cmd_from_pid(req.pid()), "Not implemented");
                 req.reply_error(libc::ENOSYS)?
             }
         }
@@ -182,10 +192,7 @@ impl Context {
     async fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.parent()) {
             Some(parent) => parent.join(op.name()),
-            None => {
-                tracing::error!("no inode registered");
-                return req.reply_error(libc::EINVAL);
-            }
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
@@ -221,17 +228,19 @@ impl Context {
 
                 req.reply(out)
             }
-            Err(libc::ENOENT) if self.can_cache_negative_lookup(&path) => {
-                tracing::debug!("cache negative lookup");
-                // negative cache
-                let mut out = EntryOut::default();
-                out.ttl_entry(self.negative_timeout);
-                req.reply(out)
+            Err(errno) if errno == libc::ENOENT => {
+                if self.can_cache_negative_lookup(&path) {
+                    tracing::debug!("cache negative lookup");
+                    // negative cache
+                    let mut out = EntryOut::default();
+                    out.ttl_entry(self.negative_timeout);
+                    req.reply(out)
+                } else {
+                    tracing::debug!(errno);
+                    req.reply_error(errno)
+                }
             }
-            Err(errno) => {
-                tracing::warn!(?errno);
-                req.reply_error(errno)
-            }
+            Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         }
     }
 
@@ -262,10 +271,7 @@ impl Context {
     async fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => {
-                tracing::error!("no inode registered");
-                return req.reply_error(libc::EINVAL);
-            }
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
@@ -280,10 +286,7 @@ impl Context {
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(errno) => {
-                tracing::error!(?errno);
-                return req.reply_error(errno);
-            }
+            Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
         tracing::debug!(?path, attr = ?stat, "cache attr");
@@ -301,7 +304,7 @@ impl Context {
     async fn setattr(&self, req: &Request, op: op::Setattr<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
@@ -330,13 +333,12 @@ impl Context {
         stat.uid = op.uid().map(|uid| self.rmap_uid(uid));
         stat.gid = op.gid().map(|gid| self.rmap_gid(gid));
         if let Err(errno) = self.remote.setstat(&path, stat).await {
-            tracing::error!(?errno);
-            return req.reply_error(errno);
+            reply_error!(req, errno, "remote.setstat failed");
         }
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(errno) => return req.reply_error(errno),
+            Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
         tracing::debug!(?path, attr = ?stat, "cache attr");
@@ -354,23 +356,23 @@ impl Context {
     async fn readlink(&self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
-        let link = match self.remote.readlink(&path).await {
-            Ok(link) => link,
-            Err(errno) => return req.reply_error(errno),
-        };
-
-        req.reply(link)
+        match self.remote.readlink(&path).await {
+            Ok(link) => {
+                req.reply(link)
+            }
+            Err(errno) => reply_error!(req, errno, "remote.readlink failed"),
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(parent = op.parent(), name = ?op.name(), link = ?op.link()))]
     async fn symlink(&self, req: &Request, op: op::Symlink<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let link_path = parent_path.join(op.name());
@@ -378,18 +380,13 @@ impl Context {
         tracing::debug!(?link_path, ?target_path);
 
         match self.remote.symlink(&link_path, &target_path).await {
-            Ok(()) => {
-                tracing::debug!("created");
-            }
-            Err(errno) => {
-                tracing::error!(?errno);
-                return req.reply_error(errno);
-            }
+            Ok(()) => tracing::debug!("created"),
+            Err(errno) => reply_error!(req, errno, "remote.symlink failed"),
         }
 
         let stat = match self.remote.lstat(&link_path).await {
             Ok(stat) => stat,
-            Err(errno) => return req.reply_error(errno),
+            Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
         tracing::debug!(?link_path, attr = ?stat, "cache attr");
@@ -416,22 +413,18 @@ impl Context {
     async fn mkdir(&self, req: &Request, op: op::Mkdir<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         let path = parent_path.join(op.name());
         tracing::debug!(?path, mode = op.mode());
 
         if let Err(errno) = self.remote.mkdir(&path, op.mode()).await {
-            tracing::error!(?errno);
-            return req.reply_error(errno);
+            reply_error!(req, errno, "remote.mkdir failed");
         }
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
-            Err(errno) => {
-                tracing::error!(?errno);
-                return req.reply_error(errno);
-            }
+            Err(errno) => reply_error!(req, errno, "remote.lstat failed"),
         };
 
         tracing::debug!(?path, attr = ?stat, "cache attr");
@@ -459,7 +452,7 @@ impl Context {
     async fn unlink(&self, req: &Request, op: op::Unlink<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let path = parent_path.join(op.name());
@@ -475,10 +468,7 @@ impl Context {
                 self.dirent_cache.remove(&parent_path);
                 req.reply(())
             }
-            Err(errno) => {
-                tracing::error!(?errno);
-                req.reply_error(errno)
-            }
+            Err(errno) => reply_error!(req, errno, "remote.remove failed"),
         }
     }
 
@@ -486,7 +476,7 @@ impl Context {
     async fn rmdir(&self, req: &Request, op: op::Rmdir<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let path = parent_path.join(op.name());
@@ -502,10 +492,7 @@ impl Context {
                 self.dirent_cache.remove(&parent_path);
                 req.reply(())
             }
-            Err(errno) => {
-                tracing::error!(?errno);
-                req.reply_error(errno)
-            }
+            Err(errno) => reply_error!(req, errno, "remote.rmdir failed"),
         }
     }
 
@@ -513,12 +500,12 @@ impl Context {
     async fn rename(&self, req: &Request, op: op::Rename<'_>) -> io::Result<()> {
         let old_parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let new_parent_path = match self.path_table.read().await.get(op.newparent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let old_path = old_parent_path.join(op.name());
@@ -533,16 +520,9 @@ impl Context {
         if op.flags() & libc::RENAME_NOREPLACE == 0 {
             tracing::debug!(?new_path, "Trying to remove it first...");
             match self.remote.remove(&new_path).await {
-                Ok(_) => {
-                    tracing::debug!("removed");
-                }
-                Err(libc::ENOENT) => {
-                    tracing::debug!("no such file");
-                }
-                Err(errno) => {
-                    tracing::debug!(?errno);
-                    return req.reply_error(libc::EEXIST);
-                }
+                Ok(_) => tracing::debug!("removed"),
+                Err(libc::ENOENT) => tracing::debug!("no such file"),
+                Err(_) => reply_error!(req, libc::EEXIST, "remote.remove failed"),
             }
         }
 
@@ -568,10 +548,7 @@ impl Context {
                 tracing::debug!("done");
                 req.reply(())
             }
-            Err(errno) => {
-                tracing::error!(?errno);
-                req.reply_error(errno)
-            }
+            Err(errno) => reply_error!(req, errno, "remote.rename failed"),
         }
     }
 
@@ -583,7 +560,7 @@ impl Context {
     ) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
@@ -603,10 +580,7 @@ impl Context {
 
         let handle = match self.remote.opendir(&path).await {
             Ok(handle) => handle,
-            Err(errno) => {
-                tracing::error!(?errno);
-                return req.reply_error(errno)
-            }
+            Err(errno) => reply_error!(req, errno, "remote.opendir failed"),
         };
 
         let mut entries = vec![];
@@ -642,10 +616,7 @@ impl Context {
                     }
                 }
                 Err(0) => break,
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    return req.reply_error(errno)
-                }
+                Err(errno) => reply_error!(req, errno, "remote.readdir failed"),
             }
         }
         tracing::debug!(num = entries.len());
@@ -672,13 +643,12 @@ impl Context {
         tracing::debug!(offset = op.offset(), size = op.size());
 
         if op.mode() == op::ReaddirMode::Plus {
-            tracing::error!("not supported");
-            return req.reply_error(libc::ENOSYS);
+            reply_error!(req, libc::ENOSYS, "unsupported mode");
         }
 
         let handle_ref = match HandleRef::<DirHandle>::from_fh(op.fh()) {
             Some(handle_ref) => handle_ref,
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "invalid file handle"),
         };
 
         let offset = op.offset() as usize;
@@ -713,7 +683,7 @@ impl Context {
     async fn open(&self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
@@ -758,7 +728,7 @@ impl Context {
     async fn create(&self, req: &Request, op: op::Create<'_>) -> io::Result<()> {
         let parent_path = match self.path_table.read().await.get(op.parent()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
 
         let path = parent_path.join(op.name());
@@ -768,7 +738,7 @@ impl Context {
             libc::O_RDONLY => sftp::OpenFlag::READ,
             libc::O_WRONLY => sftp::OpenFlag::WRITE,
             libc::O_RDWR => sftp::OpenFlag::READ | sftp::OpenFlag::WRITE,
-            _ => return req.reply_error(libc::EINVAL),
+            _ => reply_error!(req, libc::EINVAL, "unsupported open flags"),
         };
         if op.open_flags() as i32 & libc::O_CREAT == libc::O_CREAT {
             open_flags = open_flags | sftp::OpenFlag::CREAT;
@@ -785,18 +755,14 @@ impl Context {
 
         let handle = match self.remote.open(&path, open_flags, Some(op.mode())).await {
             Ok(file) => file,
-            Err(errno) => {
-                tracing::error!(?errno);
-                return req.reply_error(errno);
-            }
+            Err(errno) => reply_error!(req, errno, "remote.open failed"),
         };
 
         let stat = match self.remote.lstat(&path).await {
             Ok(stat) => stat,
             Err(errno) => {
                 self.invoke_close(handle);
-                tracing::error!(?errno);
-                return req.reply_error(errno);
+                reply_error!(req, errno, "remote.lstat failed");
             }
         };
 
@@ -845,23 +811,16 @@ impl Context {
         tokio::spawn(async move {
             let handle = match Self::ensure_open(fh, &remote).await {
                 Ok(handle) => handle,
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    let _ = req.reply_error(errno);
-                    return;
-                }
+                Err(errno) => reply_error!(req, errno, "ensure_open failed"),
             };
             tracing::debug!("start reading...");
-            let _ = match remote.read(&handle, offset, size).await {
+            match remote.read(&handle, offset, size).await {
                 Ok((nread, chunks)) => {
                     tracing::debug!(nread);
                     req.reply(chunks)
                 }
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    req.reply_error(errno)
-                }
-            };
+                Err(errno) => reply_error!(req, errno, "remote.read failed"),
+            }
         }.instrument(tracing::debug_span!("task")));
 
         Ok(())
@@ -876,7 +835,7 @@ impl Context {
     ) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path, "invalidate cache");
         self.attr_cache.remove(&path);
@@ -889,25 +848,18 @@ impl Context {
         tokio::spawn(async move {
             let handle = match Self::ensure_open(fh, &remote).await {
                 Ok(handle) => handle,
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    let _ = req.reply_error(errno);
-                    return;
-                }
+                Err(errno) => reply_error!(req, errno, "ensure_open failed"),
             };
             tracing::debug!("start writing...");
-            let _ = match remote.write(&handle, offset, data).await {
+            match remote.write(&handle, offset, data).await {
                 Ok(()) => {
                     tracing::debug!(nwritten = size);
                     let mut out = WriteOut::default();
                     out.size(size);
                     req.reply(out)
                 }
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    req.reply_error(errno)
-                }
-            };
+                Err(errno) => reply_error!(req, errno, "remote.write failed"),
+            }
         }.instrument(tracing::debug_span!("task")));
 
         Ok(())
@@ -918,7 +870,7 @@ impl Context {
         // Assumed that all operations using the file handle have been finished.
         let mut handle = match FileHandle::from_fh(op.fh()) {
             Some(handle) => handle,
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "invalid file handle"),
         };
 
         if let Some(handle) = handle.handle.take() {
@@ -933,25 +885,22 @@ impl Context {
     async fn statfs(&self, req: &Request, op: op::Statfs<'_>) -> io::Result<()> {
         let path = match self.path_table.read().await.get(op.ino()) {
             Some(path) => path.to_owned(),
-            None => return req.reply_error(libc::EINVAL),
+            None => reply_error!(req, libc::EINVAL, "no inode registered"),
         };
         tracing::debug!(?path);
 
         let remote = self.remote.clone();
         let req = req.clone();
         tokio::spawn(async move {
-            let _ = match remote.statfs(&path).await {
+            match remote.statfs(&path).await {
                 Ok(statfs) => {
                     tracing::debug!(?statfs);
                     let mut out = StatfsOut::default();
                     Self::fill_statfs(&statfs, out.statfs());
                     req.reply(out)
                 }
-                Err(errno) => {
-                    tracing::error!(?errno);
-                    req.reply_error(errno)
-                }
-            };
+                Err(errno) => reply_error!(req, errno, "remote.statfs failed"),
+            }
         }.instrument(tracing::debug_span!("task")));
 
         Ok(())
@@ -1075,11 +1024,11 @@ impl Context {
     }
 
     fn invoke_close(&self, handle: sftp::FileHandle) {
-        let sftp = self.remote.clone();
+        let remote = self.remote.clone();
         tokio::spawn(async move {
-            match sftp.close(&handle).await {
+            match remote.close(&handle).await {
                 Ok(_) => tracing::debug!("closed successfully"),
-                Err(err) => tracing::error!(?err, "sftp.close failed"),
+                Err(errno) => tracing::error!(errno, "remote.close failed"),
             }
         }.instrument(tracing::debug_span!("task")));
     }
@@ -1291,4 +1240,12 @@ impl PathTable {
         }
         tracing::debug!(?new, ino, "inserted");
     }
+}
+
+fn cmd_from_pid(pid: u32) -> String {
+    procfs::process::Process::new(pid as libc::pid_t)
+        .ok()
+        .map(|proc| proc.cmdline().ok())
+        .flatten()
+        .map_or("".to_string(), |v| v.join(" "))
 }
