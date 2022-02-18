@@ -124,15 +124,37 @@ macro_rules! reply_error {
 
 impl Context {
     fn new(config: &Config, remote: sftp::Session) -> Result<Self> {
-        let context = Self {
+        let dirent_cache = DashMap::new();
+        dirent_cache.insert(
+            PathBuf::from(".workspacefs.d"),
+            Arc::new(vec![
+                DirEntry {
+                    name: sftp::REQUESTS_STATS.to_string(),
+                    typ: libc::S_IFREG,
+                    ino: NO_INO,
+                },
+            ]),
+        );
+
+        let attr_cache = DashMap::new();
+        attr_cache.insert(PathBuf::from(".workspacefs.d"), Arc::new(remote::Stat {
+            size: Some(0),
+            atime: Some(0),
+            mtime: Some(0),
+            mode: Some(libc::S_IFDIR | 0o0755),
+            uid: Some(0),
+            gid: Some(0),
+        }));
+
+        Ok(Self {
             remote,
             path_table: RwLock::new(PathTable::new()),
             uid_map: Self::make_map(&config.uid_map),
             uid_rmap: Self::make_rmap(&config.uid_map),
             gid_map: Self::make_map(&config.gid_map),
             gid_rmap: Self::make_rmap(&config.gid_map),
-            attr_cache: DashMap::new(),
-            dirent_cache: DashMap::new(),
+            attr_cache,
+            dirent_cache,
             page_cache_xglobset: Self::make_globset(
                 &config.cache.page_cache.excludes, &config.cache.excludes)?,
             dentry_cache_xglobset: Self::make_globset(
@@ -146,19 +168,7 @@ impl Context {
             negative_timeout: config.cache.negative.timeout.clone().into(),
             negative_xglobset: Self::make_globset(
                 &config.cache.negative.excludes, &config.cache.excludes)?,
-        };
-
-        context.attr_cache.insert(PathBuf::from(".workspacefs.d"), Arc::new(remote::Stat {
-            size: Some(0),
-            atime: Some(0),
-            mtime: Some(0),
-            mode: Some(libc::S_IFDIR | 0o0755),
-            uid: Some(0),
-            gid: Some(0),
-        }));
-        context.dirent_cache.insert(PathBuf::from(".workspacefs.d"), Arc::new(vec![]));
-
-        Ok(context)
+        })
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(id = req.unique(), uid = req.uid(), gid = req.gid(), pid = req.pid()))]
@@ -1073,13 +1083,15 @@ impl Context {
         for glob in globs.iter() {
             builder.add(Glob::new(glob)?);
         }
+        // Special cases
+        builder.add(Glob::new(".workspacefs.d/*")?);
         Ok(builder.build()?)
     }
 
     fn invoke_close(&self, handle: sftp::FileHandle) {
         let remote = self.remote.clone();
         tokio::spawn(async move {
-            match remote.close(&handle).await {
+            match remote.close(handle).await {
                 Ok(_) => tracing::debug!("closed successfully"),
                 Err(errno) => tracing::error!(errno, "remote.close failed"),
             }
@@ -1242,8 +1254,8 @@ impl PathTable {
         self.path_to_ino.get(path).cloned()
     }
 
-    fn recognize(&mut self, path: &Path) -> (u64, u64) {
-        match self.path_to_ino.get(path) {
+    fn recognize<P: AsRef<Path>>(&mut self, path: P) -> (u64, u64) {
+        match self.path_to_ino.get(path.as_ref()) {
             Some(ino) => {
                 let mut inode = self.inodes.get_mut(ino).expect("inode is missing");
                 inode.refcount += 1;
@@ -1255,9 +1267,9 @@ impl PathTable {
                     refcount: 1,
                     ino,
                     generation,
-                    path: path.to_owned(),
+                    path: path.as_ref().to_owned(),
                 });
-                self.path_to_ino.insert(path.to_owned(), ino);
+                self.path_to_ino.insert(path.as_ref().to_owned(), ino);
                 (ino, generation)
             }
         }
@@ -1301,4 +1313,23 @@ fn cmd_from_pid(pid: u32) -> String {
         .map(|proc| proc.cmdline().ok())
         .flatten()
         .map_or("".to_string(), |v| v.join(" "))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_context_make_globset() {
+        let globset = Context::make_globset(
+            &["a/*".to_string()],
+            &["b/*".to_string()],
+        ).unwrap();
+        assert!(globset.is_match("a/x"));
+        assert!(globset.is_match("b/x"));
+        assert!(!globset.is_match("c/x"));
+        assert!(!globset.is_match(".workspacefs.d"));
+        assert!(globset.is_match(".workspacefs.d/"));
+        assert!(globset.is_match(".workspacefs.d/file"));
+    }
 }

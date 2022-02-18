@@ -15,15 +15,20 @@ use bytes::BytesMut;
 use dashmap::DashMap;
 use std::borrow::Cow;
 use std::fmt;
+use std::ffi::OsStr;
 use std::io;
+use std::io::Write;
 use std::io::IoSlice;
 use std::mem;
+use std::ops::AddAssign;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -276,14 +281,22 @@ impl fmt::Debug for FileAttr {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FileHandle(Vec<u8>);
+pub(crate) enum FileHandle {
+    Remote(Vec<u8>),
+    // For special entries
+    SftpRequests,
+}
 
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
 pub(crate) struct Session {
     base_path: PathBuf,
     inner: Weak<Inner>,
+    metrics: Arc<Metrics>,
 }
+
+const SPECIAL_DIR: &'static str = ".workspacefs.d";
+pub(crate) const REQUESTS_STATS: &'static str = "sftp.requests";
 
 impl Session {
     async fn request(
@@ -292,11 +305,33 @@ impl Session {
         payload: Vec<Bytes>,
     ) -> Result<Response, i32> {
         let inner = self.inner.upgrade().ok_or(libc::EIO)?;
+        self.metrics.count_request(packet_type);
         inner.send_request(packet_type, payload).await
     }
 
-    /// Request to open a file.
     pub(crate) async fn open<P>(
+        &self,
+        filename: P,
+        pflags: OpenFlag,
+        mode: Option<u32>,
+    ) -> Result<FileHandle, i32>
+    where
+        P: AsRef<Path>,
+    {
+        match filename.as_ref().strip_prefix(SPECIAL_DIR) {
+            Ok(filename) => {
+                if filename == Path::new(REQUESTS_STATS) {
+                    Ok(FileHandle::SftpRequests)
+                } else {
+                    Err(libc::ENOENT)
+                }
+            }
+            Err(_) => self.do_open(filename, pflags, mode).await
+        }
+    }
+
+    #[instrument(name = "sftp.open", level = "debug", skip_all, fields(filename, pflags, mode))]
+    async fn do_open<P>(
         &self,
         filename: P,
         pflags: OpenFlag,
@@ -331,13 +366,20 @@ impl Session {
         }
     }
 
-    /// Request to close a file corresponding to the specified handle.
-    pub(crate) async fn close(&self, handle: &FileHandle) -> Result<(), i32> {
-        let len = 4 + handle.0.len();
+    pub(crate) async fn close(&self, handle: FileHandle) -> Result<(), i32> {
+        match handle {
+            FileHandle::Remote(ref handle) => self.do_close(handle).await,
+            _ => Ok(()),
+        }
+    }
+
+    #[instrument(name = "sftp.close", level = "debug", skip_all, fields(handle))]
+    async fn do_close(&self, handle: &[u8]) -> Result<(), i32> {
+        let len = 4 + handle.len();
 
         let mut payload = BytesMut::with_capacity(len);
-        payload.put_u32(handle.0.len() as u32);
-        payload.put(&handle.0[..]);
+        payload.put_u32(handle.len() as u32);
+        payload.put(handle);
 
         match self.request(SSH_FXP_CLOSE, vec![payload.freeze()]).await? {
             Response::Status { code, ..} if code == SSH_FX_OK => Ok(()),
@@ -352,12 +394,22 @@ impl Session {
         }
     }
 
-    /// Request to read a range of data from an opened file corresponding to the specified handle.
-    #[instrument(name = "sftp.read", level = "debug", skip_all,
-                 fields(handle = ?handle.0, offset, len))]
     pub(crate) async fn read(
         &self,
         handle: &FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<(usize, Vec<Vec<u8>>), i32> {
+        match handle {
+            FileHandle::SftpRequests => self.metrics.read_requests(offset, len),
+            FileHandle::Remote(ref handle) => self.do_read(handle, offset, len).await,
+        }
+    }
+
+    #[instrument(name = "sftp.read", level = "debug", skip_all, fields(handle, offset, len))]
+    async fn do_read(
+        &self,
+        handle: &[u8],
         offset: u64,
         len: u32,
     ) -> Result<(usize, Vec<Vec<u8>>), i32> {
@@ -392,7 +444,7 @@ impl Session {
 
     async fn read_chunk(
         &self,
-        handle: &FileHandle,
+        handle: &[u8],
         offset: usize,
         len: usize,
     ) -> Result<Vec<u8>, i32> {
@@ -401,11 +453,11 @@ impl Session {
 
         tracing::debug!(offset, len, "reading a chunk...");
 
-        let payload_len = 16 + handle.0.len();
+        let payload_len = 16 + handle.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.len() as u32);
-        payload.put(&handle.0[..]);
+        payload.put_u32(handle.len() as u32);
+        payload.put(handle);
         payload.put_u64(offset as u64);
         payload.put_u32(len as u32);
 
@@ -426,12 +478,22 @@ impl Session {
         }
     }
 
-    /// Request to write a range of data to an opened file corresponding to the specified handle.
-    #[instrument(name = "sftp.write", level = "debug", skip_all,
-                 fields(handle = ?handle.0, offset, len = data.len()))]
     pub(crate) async fn write(
         &self,
         handle: &FileHandle,
+        offset: u64,
+        data: Bytes
+    ) -> Result<(), i32> {
+        match handle {
+            FileHandle::SftpRequests => Err(libc::EPERM),
+            FileHandle::Remote(ref handle) => self.do_write(handle, offset, data).await,
+        }
+    }
+
+    #[instrument(name = "sftp.write", level = "debug", skip_all, fields(handle, offset, len = data.len()))]
+    async fn do_write(
+        &self,
+        handle: &[u8],
         offset: u64,
         data: Bytes
     ) -> Result<(), i32> {
@@ -460,17 +522,17 @@ impl Session {
 
     async fn write_chunk(
         &self,
-        handle: &FileHandle,
+        handle: &[u8],
         offset: u64,
         data: Bytes
     ) -> Result<(), i32> {
         tracing::debug!(offset, len = data.len(), "writing a chunk...");
 
-        let params_len = 16 + handle.0.len();
+        let params_len = 16 + handle.len();
 
         let mut params = BytesMut::with_capacity(params_len);
-        params.put_u32(handle.0.len() as u32);
-        params.put(&handle.0[..]);
+        params.put_u32(handle.len() as u32);
+        params.put(handle);
         params.put_u64(offset as u64);
         params.put_u32(data.len() as u32);
 
@@ -490,9 +552,18 @@ impl Session {
         }
     }
 
-    /// Request to retrieve attribute values for a named file, without following symbolic links.
-    #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
     pub(crate) async fn lstat<P>(&self, path: P) -> Result<Stat, i32>
+    where
+        P: AsRef<Path>,
+    {
+        match path.as_ref().strip_prefix(SPECIAL_DIR) {
+            Ok(filename) => self.metrics.stat(filename),
+            Err(_) => self.do_lstat(path).await,
+        }
+    }
+
+    #[instrument(name = "sftp.lstat", level = "debug", skip_all)]
+    async fn do_lstat<P>(&self, path: P) -> Result<Stat, i32>
     where
         P: AsRef<Path>,
     {
@@ -522,14 +593,20 @@ impl Session {
         }
     }
 
-    /// Request to retrieve attribute values for a named file.
-    #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
     pub(crate) async fn fstat(&self, handle: &FileHandle) -> Result<Stat, i32> {
-        let payload_len = 4 + handle.0.len();
+        match handle {
+            FileHandle::SftpRequests => self.metrics.stat(OsStr::new(REQUESTS_STATS)),
+            FileHandle::Remote(ref handle) => self.do_fstat(&handle).await,
+        }
+    }
+
+    #[instrument(name = "sftp.fstat", level = "debug", skip_all)]
+    async fn do_fstat(&self, handle: &[u8]) -> Result<Stat, i32> {
+        let payload_len = 4 + handle.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.len() as u32);
-        payload.put(&handle.0[..]);
+        payload.put_u32(handle.len() as u32);
+        payload.put(handle);
 
         match self.request(SSH_FXP_FSTAT, vec![payload.freeze()]).await? {
             Response::Attrs(attrs) => Ok(attrs.into()),
@@ -544,8 +621,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
     pub(crate) async fn setstat<P>(&self, path: P, stat: Stat) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_setstat(path, stat).await
+        }
+    }
+
+    #[instrument(name = "sftp.setstat", level = "debug", skip_all)]
+    async fn do_setstat<P>(&self, path: P, stat: Stat) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -574,14 +662,21 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
     pub(crate) async fn fsetstat(&self, handle: &FileHandle, stat: Stat) -> Result<(), i32> {
+        match handle {
+            FileHandle::Remote(ref handle) => self.do_fsetstat(&handle, stat).await,
+            _ => Err(libc::EPERM),
+        }
+    }
+
+    #[instrument(name = "sftp.fsetstat", level = "debug", skip_all)]
+    async fn do_fsetstat(&self, handle: &[u8], stat: Stat) -> Result<(), i32> {
         let attrs = FileAttr::from(stat);
-        let payload_len = 4 + handle.0.len() + attrs.count_bytes();
+        let payload_len = 4 + handle.len() + attrs.count_bytes();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.len() as u32);
-        payload.put(&handle.0[..]);
+        payload.put_u32(handle.len() as u32);
+        payload.put(handle);
         attrs.put_bytes(&mut payload);
 
         match self.request(SSH_FXP_FSETSTAT, vec![payload.freeze()]).await? {
@@ -597,9 +692,19 @@ impl Session {
         }
     }
 
-    /// Request to open a directory for reading.
-    #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
     pub(crate) async fn opendir<P>(&self, path: P) -> Result<FileHandle, i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_opendir(path).await
+        }
+    }
+
+    #[instrument(name = "sftp.opendir", level = "debug", skip_all)]
+    async fn do_opendir<P>(&self, path: P) -> Result<FileHandle, i32>
     where
         P: AsRef<Path>,
     {
@@ -626,14 +731,20 @@ impl Session {
         }
     }
 
-    /// Request to list files and directories contained in an opened directory.
-    #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
     pub(crate) async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, i32> {
-        let payload_len = 4 + handle.0.len();
+        match handle {
+            FileHandle::Remote(ref handle) => self.do_readdir(handle).await,
+            _ => Err(libc::EPERM),
+        }
+    }
+
+    #[instrument(name = "sftp.readdir", level = "debug", skip_all)]
+    async fn do_readdir(&self, handle: &[u8]) -> Result<Vec<DirEntry>, i32> {
+        let payload_len = 4 + handle.len();
 
         let mut payload = BytesMut::with_capacity(payload_len);
-        payload.put_u32(handle.0.len() as u32);
-        payload.put(&handle.0[..]);
+        payload.put_u32(handle.len() as u32);
+        payload.put(handle);
 
         match self.request(SSH_FXP_READDIR, vec![payload.freeze()]).await? {
             Response::Name(entries) => Ok(entries),
@@ -649,8 +760,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.remove", level = "debug", skip_all)]
     pub(crate) async fn remove<P>(&self, path: P) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_remove(path).await
+        }
+    }
+
+    #[instrument(name = "sftp.remove", level = "debug", skip_all)]
+    async fn do_remove<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -677,8 +799,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
     pub(crate) async fn mkdir<P>(&self, path: P, mode: u32) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_mkdir(path, mode).await
+        }
+    }
+
+    #[instrument(name = "sftp.mkdir", level = "debug", skip_all)]
+    async fn do_mkdir<P>(&self, path: P, mode: u32) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -709,8 +842,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
     pub(crate) async fn rmdir<P>(&self, path: P) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_rmdir(path).await
+        }
+    }
+
+    #[instrument(name = "sftp.rmdir", level = "debug", skip_all)]
+    async fn do_rmdir<P>(&self, path: P) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -737,8 +881,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
     pub(crate) async fn realpath<P>(&self, path: P) -> Result<String, i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EINVAL)
+        } else {
+            self.do_realpath(path).await
+        }
+    }
+
+    #[instrument(name = "sftp.realpath", level = "debug", skip_all)]
+    async fn do_realpath<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -767,9 +922,18 @@ impl Session {
         }
     }
 
-    /// Request to retrieve attribute values for a named file.
-    #[instrument(name = "sftp.stat", level = "debug", skip_all)]
     pub(crate) async fn stat<P>(&self, path: P) -> Result<Stat, i32>
+    where
+        P: AsRef<Path>,
+    {
+        match path.as_ref().strip_prefix(SPECIAL_DIR) {
+            Ok(filename) => self.metrics.stat(filename),
+            Err(_) => self.do_stat(path).await,
+        }
+    }
+
+    #[instrument(name = "sftp.stat", level = "debug", skip_all)]
+    async fn do_stat<P>(&self, path: P) -> Result<Stat, i32>
     where
         P: AsRef<Path>,
     {
@@ -796,8 +960,21 @@ impl Session {
         }
     }
 
+    pub(crate) async fn rename<P>(&self, old_path: P, new_path: P) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+    {
+        if old_path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else if new_path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_rename(old_path, new_path).await
+        }
+    }
+
     #[instrument(name = "sftp.rename", level = "debug", skip_all)]
-    pub(crate) async fn rename<P>(&self, old_path: P, new_path: P,) -> Result<(), i32>
+    async fn do_rename<P>(&self, old_path: P, new_path: P,) -> Result<(), i32>
     where
         P: AsRef<Path>,
     {
@@ -841,8 +1018,19 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
     pub(crate) async fn readlink<P>(&self, path: P) -> Result<String, i32>
+    where
+        P: AsRef<Path>,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EINVAL)
+        } else {
+            self.do_readlink(path).await
+        }
+    }
+
+    #[instrument(name = "sftp.readlink", level = "debug", skip_all)]
+    async fn do_readlink<P>(&self, path: P) -> Result<String, i32>
     where
         P: AsRef<Path>,
     {
@@ -871,8 +1059,20 @@ impl Session {
         }
     }
 
-    #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
     pub(crate) async fn symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), i32>
+    where
+        P: AsRef<Path>,
+        Q: AsRef<Path> + fmt::Debug,
+    {
+        if path.as_ref().starts_with(SPECIAL_DIR) {
+            Err(libc::EPERM)
+        } else {
+            self.do_symlink(path, target_path).await
+        }
+    }
+
+    #[instrument(name = "sftp.symlink", level = "debug", skip_all)]
+    async fn do_symlink<P, Q>(&self, path: P, target_path: Q) -> Result<(), i32>
     where
         P: AsRef<Path>,
         Q: AsRef<Path> + fmt::Debug,
@@ -1100,6 +1300,7 @@ pub(crate) async fn init(config: &SftpConfig) -> Result<Session, Error> {
     let se = Session {
         base_path: config.path.clone(),
         inner: Arc::downgrade(&conn.inner),
+        metrics: Arc::new(Metrics::new()),
     };
     Ok(se)
 }
@@ -1285,7 +1486,7 @@ async fn recv_loop(
             SSH_FXP_HANDLE => {
                 let handle = packet.read_bytes().await?;
                 tracing::trace!(id, r#type = "HANDLE", ?handle);
-                Response::Handle(FileHandle(handle))
+                Response::Handle(FileHandle::Remote(handle))
             }
             SSH_FXP_DATA => {
                 let data = packet.read_bytes().await?;
@@ -1474,6 +1675,95 @@ where
     }
 }
 
+#[derive(Debug)]
+struct Metrics {
+    requests: DashMap<u8, u64>,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let requests = DashMap::new();
+        requests.insert(SSH_FXP_INIT, 1);
+
+        Metrics {
+            requests,
+        }
+    }
+
+    #[inline]
+    fn count_request(&self, packet_type: u8) {
+        self.requests
+            .entry(packet_type)
+            .or_default()
+            .value_mut()
+            .add_assign(1);
+    }
+
+    fn stat<S: AsRef<OsStr>>(&self, filename: S) -> Result<Stat, i32> {
+        let filename = filename.as_ref();
+        if filename != REQUESTS_STATS {
+            return Err(libc::ENOENT);
+        }
+
+        let size = self.serialize_requests_stats().ok().map(|d| d.len() as u64);
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| dur.as_secs() as u32)
+            .ok();
+        Ok(Stat {
+            size,
+            atime: now,
+            mtime: now,
+            mode: Some(libc::S_IFREG | 0o0444),
+            uid: Some(0),
+            gid: Some(0),
+        })
+    }
+
+    fn serialize_requests_stats(&self) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(4096);
+        for pair in self.requests.iter() {
+            write!(&mut buf, "{} {}\n", packet_type_name(*pair.key()),  pair.value())?
+        }
+        Ok(buf)
+    }
+
+    fn read_requests(
+        &self,
+        offset: u64,
+        len: u32,
+    ) -> Result<(usize, Vec<Vec<u8>>), i32> {
+        match self.serialize_requests_stats() {
+            Ok(data) => Ok(Self::read_vectored(data, offset, len)),
+            Err(_) => Err(libc::EIO),
+        }
+    }
+
+    fn read_vectored(data: Vec<u8>, offset: u64, len: u32) -> (usize, Vec<Vec<u8>>) {
+        let range = Self::saturating_range(offset, len, data.len());
+        if range.is_empty() {
+            (0, vec![vec![]])
+        } else {
+            (range.len(), vec![data[range].to_vec()])
+        }
+    }
+
+    fn saturating_range(offset: u64, len: u32, bound: usize) -> Range<usize> {
+        let start = if (offset as usize) < bound {
+            offset as usize
+        } else {
+            bound
+        };
+        let end = if (start + len as usize) < bound {
+            start + len as usize
+        } else {
+            bound
+        };
+        start..end
+    }
+}
+
 // ==== misc ====
 
 #[inline]
@@ -1489,5 +1779,38 @@ fn status_code_to_errno(code: u32) -> i32 {
         SSH_FX_PERMISSION_DENIED => libc::EPERM,
         SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
         _ => libc::EIO,
+    }
+}
+
+fn packet_type_name(packet_type: u8) -> &'static str {
+    match packet_type {
+        SSH_FXP_INIT => "SSH_FXP_INIT",
+        SSH_FXP_VERSION => "SSH_FXP_VERSION",
+        SSH_FXP_OPEN => "SSH_FXP_OPEN",
+        SSH_FXP_CLOSE => "SSH_FXP_CLOSE",
+        SSH_FXP_READ => "SSH_FXP_READ",
+        SSH_FXP_WRITE => "SSH_FXP_WRITE",
+        SSH_FXP_LSTAT => "SSH_FXP_LSTAT",
+        SSH_FXP_FSTAT => "SSH_FXP_FSTAT",
+        SSH_FXP_SETSTAT => "SSH_FXP_SETSTAT",
+        SSH_FXP_FSETSTAT => "SSH_FXP_FSETSTAT",
+        SSH_FXP_OPENDIR => "SSH_FXP_OPENDIR",
+        SSH_FXP_READDIR => "SSH_FXP_READDIR",
+        SSH_FXP_REMOVE => "SSH_FXP_REMOVE",
+        SSH_FXP_MKDIR => "SSH_FXP_MKDIR",
+        SSH_FXP_RMDIR => "SSH_FXP_RMDIR",
+        SSH_FXP_REALPATH => "SSH_FXP_REALPATH",
+        SSH_FXP_STAT => "SSH_FXP_STAT",
+        SSH_FXP_RENAME => "SSH_FXP_RENAME",
+        SSH_FXP_READLINK => "SSH_FXP_READLINK",
+        SSH_FXP_SYMLINK => "SSH_FXP_SYMLINK",
+        SSH_FXP_STATUS => "SSH_FXP_STATUS",
+        SSH_FXP_HANDLE => "SSH_FXP_HANDLE",
+        SSH_FXP_DATA => "SSH_FXP_DATA",
+        SSH_FXP_NAME => "SSH_FXP_NAME",
+        SSH_FXP_ATTRS => "SSH_FXP_ATTRS",
+        SSH_FXP_EXTENDED => "SSH_FXP_EXTENDED",
+        SSH_FXP_EXTENDED_REPLY => "SSH_FXP_EXTENDED_REPLY",
+        _ => "SSH_FXP_UNKNOWN",
     }
 }
